@@ -1,0 +1,3295 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Sonim Reader"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+
+        <activity
+            android:name="com.sonim.reader.MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name="com.sonim.reader.FilePickerActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:label="Select Text File" />
+
+    </application>
+</manifest>
+package com.sonim.reader;
+
+import android.app.ListActivity;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Bundle;
+import android.view.KeyEvent;
+import android.view.View;
+import android.widget.ArrayAdapter;
+import android.widget.ListView;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Focus-based File Picker for Sonim XP5S.
+ * Starts at /storage/ to allow access to Internal Storage and SD Card.
+ */
+public class FilePickerActivity extends ListActivity {
+
+    private File currentDir;
+    private List<File> filesInDir = new ArrayList<>();
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        // Starting at /storage/ ensures we see both Internal and SD card partitions
+        currentDir = new File("/storage/");
+        if (!currentDir.exists() || !currentDir.canRead()) {
+            currentDir = new File("/"); // Absolute root fallback
+        }
+
+        refreshFiles();
+    }
+
+    private void refreshFiles() {
+        setTitle(currentDir.getPath());
+        filesInDir.clear();
+
+        File[] files = currentDir.listFiles();
+        List<String> displayNames = new ArrayList<>();
+
+        // Add "Back" option if we aren't at the absolute root
+        if (currentDir.getParentFile() != null) {
+            displayNames.add(".. (Go Back)");
+            filesInDir.add(currentDir.getParentFile());
+        }
+
+        if (files != null) {
+            List<File> sortedFiles = new ArrayList<>();
+            for (File f : files) {
+                // We only care about Directories and readable text files (.txt / .org).
+                String lower = f.getName().toLowerCase();
+                boolean isText = lower.endsWith(".txt") || lower.endsWith(".org");
+                if (f.isDirectory() || isText) {
+                    // Filter out hidden folders/files
+                    if (!f.getName().startsWith(".")) {
+                        sortedFiles.add(f);
+                    }
+                }
+            }
+
+            // Sort so Folders are at the top, then files alphabetically
+            Collections.sort(sortedFiles, (a, b) -> {
+                if (a.isDirectory() && !b.isDirectory()) return -1;
+                if (!a.isDirectory() && b.isDirectory()) return 1;
+                return a.getName().compareToIgnoreCase(b.getName());
+            });
+
+            for (File f : sortedFiles) {
+                filesInDir.add(f);
+                displayNames.add(f.isDirectory() ? "[Folder] " + f.getName() : f.getName());
+            }
+        }
+
+        setListAdapter(new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, displayNames));
+    }
+
+    /**
+     * Handles the DPAD_CENTER / ENTER click on a list item
+     */
+    @Override
+    protected void onListItemClick(ListView l, View v, int position, long id) {
+        File selected = filesInDir.get(position);
+
+        if (selected.isDirectory()) {
+            currentDir = selected;
+            refreshFiles();
+            // Reset selection to the top of the new folder
+            getListView().setSelection(0);
+        } else {
+            // Return the file back to the Reader
+            Intent result = new Intent();
+            result.setData(Uri.fromFile(selected));
+            setResult(RESULT_OK, result);
+            finish();
+        }
+    }
+
+    /**
+     * Key listener to handle the physical Back button for folder navigation
+     */
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            // If we are deep in folders, use Back to go up one level
+            if (currentDir.getParentFile() != null && !currentDir.getPath().equals("/storage")) {
+                currentDir = currentDir.getParentFile();
+                refreshFiles();
+                return true;
+            }
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+}
+package com.sonim.reader;
+
+import android.Manifest;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.net.Uri;
+import android.os.BatteryManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
+import android.view.KeyEvent;
+import android.view.View;
+import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ListView;
+import android.widget.TextView;
+
+import com.sonim.reader.core.LineProvider;
+import com.sonim.reader.core.OrgHeading;
+import com.sonim.reader.core.ReaderSettings;
+import com.sonim.reader.data.PrefsBookmarkRepository;
+import com.sonim.reader.data.PrefsReadingStateStore;
+import com.sonim.reader.ui.AndroidMainThread;
+import com.sonim.reader.ui.AtomicFileSaver;
+import com.sonim.reader.ui.ContentStreamOpener;
+import com.sonim.reader.ui.KeyCommandRouter;
+import com.sonim.reader.ui.LineAdapter;
+import com.sonim.reader.ui.ReaderController;
+import com.sonim.reader.ui.ReaderView;
+
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Thin host screen. It builds the object graph, renders what
+ * {@link ReaderController} tells it to, and forwards key events to
+ * {@link KeyCommandRouter}. All reading behaviour lives in the controller.
+ */
+public class MainActivity extends Activity implements ReaderView {
+
+    private static final int PICK_FILE_REQUEST = 1;
+    private static final int STORAGE_PERMISSION_REQUEST = 2;
+
+    private ListView listView;
+    private LinearLayout searchContainer;
+    private EditText searchInput;
+    private LinearLayout hudOverlay;
+    private TextView hudText;
+    private TextView statusOverlay;
+    private FrameLayout editContainer;
+    private EditText editInput;
+
+    private ReaderController controller;
+    private KeyCommandRouter router;
+    private ExecutorService background;
+    private final Handler statusHandler = new Handler(Looper.getMainLooper());
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        // Reading with no touchscreen: never let the screen time out mid-page.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        listView = findViewById(R.id.text_list);
+        searchContainer = findViewById(R.id.search_container);
+        searchInput = findViewById(R.id.search_input);
+        hudOverlay = findViewById(R.id.hud_overlay);
+        hudText = findViewById(R.id.hud_text);
+        statusOverlay = findViewById(R.id.status_overlay);
+        editContainer = findViewById(R.id.edit_container);
+        editInput = findViewById(R.id.edit_input);
+        listView.setDivider(null);
+
+        background = Executors.newSingleThreadExecutor();
+        controller = new ReaderController(
+                this,
+                new PrefsBookmarkRepository(this),
+                new PrefsReadingStateStore(this),
+                background,
+                new AndroidMainThread());
+        router = new KeyCommandRouter(controller, this);
+
+        setupSearchListener();
+        ensureStoragePermissionThenPick();
+    }
+
+    private void setupSearchListener() {
+        searchInput.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH
+                    || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
+                controller.performSearch(searchInput.getText().toString());
+                return true;
+            }
+            return false;
+        });
+    }
+
+    // --------------------------------------------------------- permission flow
+
+    private void ensureStoragePermissionThenPick() {
+        // WRITE is requested up front alongside READ so saving edits later needs
+        // no second prompt. READ is the gate for even opening a file.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                        != PackageManager.PERMISSION_GRANTED
+                    || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        != PackageManager.PERMISSION_GRANTED)) {
+            requestPermissions(
+                    new String[]{
+                            Manifest.permission.READ_EXTERNAL_STORAGE,
+                            Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                    STORAGE_PERMISSION_REQUEST);
+        } else {
+            openFilePicker();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == STORAGE_PERMISSION_REQUEST) {
+            // READ lets us read; WRITE only matters when saving, so a denied WRITE
+            // still opens the reader (a later save just reports "Save failed").
+            boolean readGranted = false;
+            for (int i = 0; i < permissions.length; i++) {
+                if (Manifest.permission.READ_EXTERNAL_STORAGE.equals(permissions[i])
+                        && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
+                    readGranted = true;
+                }
+            }
+            if (readGranted) {
+                openFilePicker();
+            } else {
+                showStatus("Storage permission required");
+                finish();
+            }
+        }
+    }
+
+    private void openFilePicker() {
+        startActivityForResult(new Intent(this, FilePickerActivity.class), PICK_FILE_REQUEST);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == PICK_FILE_REQUEST && resultCode == RESULT_OK && data != null
+                && data.getData() != null) {
+            Uri uri = data.getData();
+            controller.load(uri.toString(),
+                    new ContentStreamOpener(this, uri),
+                    new AtomicFileSaver(this, uri));
+        } else if (!controller.hasDocument()) {
+            finish();
+        }
+    }
+
+    // ---------------------------------------------------------- key delegation
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        // In the editor, the router owns only the control keys (Back/Menu/OK);
+        // everything else falls through to the focused EditText so the T9 keypad
+        // types and the D-pad moves the caret.
+        if (controller.isEditing() && router.onEditKey(event)) {
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (controller.isEditing()) return super.onKeyDown(keyCode, event);
+        return router.onKeyDown(keyCode, event) || super.onKeyDown(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (controller.isEditing()) return super.onKeyUp(keyCode, event);
+        return router.onKeyUp(keyCode, event) || super.onKeyUp(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyLongPress(int keyCode, KeyEvent event) {
+        if (controller.isEditing()) return super.onKeyLongPress(keyCode, event);
+        return router.onKeyLongPress(keyCode, event) || super.onKeyLongPress(keyCode, event);
+    }
+
+    @Override
+    public void onBackPressed() {
+        controller.onBackPressed();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        controller.savePosition();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (background != null) background.shutdownNow();
+    }
+
+    // ------------------------------------------------------------- ReaderView
+
+    @Override
+    public void showDocument(LineProvider lines, ReaderSettings settings) {
+        listView.setAdapter(new LineAdapter(this, lines, settings));
+        applyBackground(settings);
+    }
+
+    @Override
+    public void refreshAppearance() {
+        applyBackground(controller.settings());
+        if (listView.getAdapter() instanceof LineAdapter) {
+            ((LineAdapter) listView.getAdapter()).notifyDataSetChanged();
+        }
+    }
+
+    private void applyBackground(ReaderSettings settings) {
+        listView.setBackgroundColor(settings.isNightMode() ? Color.BLACK : Color.WHITE);
+    }
+
+    @Override
+    public int getTopLine() {
+        return listView.getFirstVisiblePosition();
+    }
+
+    @Override
+    public void scrollToLine(int line) {
+        listView.setSelection(line);
+    }
+
+    @Override
+    public void pageDown() {
+        int first = listView.getFirstVisiblePosition();
+        int page = Math.max(1, listView.getLastVisiblePosition() - first);
+        int count = listView.getAdapter() == null ? 0 : listView.getAdapter().getCount();
+        listView.setSelection(Math.min(Math.max(0, count - 1), first + page));
+    }
+
+    @Override
+    public void pageUp() {
+        int first = listView.getFirstVisiblePosition();
+        int page = Math.max(1, listView.getLastVisiblePosition() - first);
+        listView.setSelection(Math.max(0, first - page));
+    }
+
+    @Override
+    public int getBatteryPercent() {
+        Intent battery = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (battery == null) return -1;
+        int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+        if (level < 0 || scale <= 0) return -1;
+        return level * 100 / scale;
+    }
+
+    @Override
+    public void showStatus(String message) {
+        statusOverlay.setText(message);
+        statusOverlay.setVisibility(View.VISIBLE);
+        statusHandler.removeCallbacksAndMessages(null);
+        statusHandler.postDelayed(() -> statusOverlay.setVisibility(View.GONE), 1200);
+    }
+
+    @Override
+    public void setSearchVisible(boolean visible) {
+        searchContainer.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (visible) {
+            searchInput.requestFocus();
+        } else {
+            listView.requestFocus();
+        }
+    }
+
+    @Override
+    public boolean isSearchVisible() {
+        return searchContainer.getVisibility() == View.VISIBLE;
+    }
+
+    @Override
+    public String getSearchQuery() {
+        return searchInput.getText().toString();
+    }
+
+    @Override
+    public void setHudVisible(boolean visible, String text) {
+        if (visible) {
+            hudText.setText(text);
+            hudOverlay.setVisibility(View.VISIBLE);
+        } else {
+            hudOverlay.setVisibility(View.GONE);
+        }
+    }
+
+    @Override
+    public boolean isHudVisible() {
+        return hudOverlay.getVisibility() == View.VISIBLE;
+    }
+
+    @Override
+    public void promptForPercentage(PercentageCallback onValue) {
+        final EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER);
+        new AlertDialog.Builder(this)
+                .setTitle("Jump to % (0-100)")
+                .setView(input)
+                .setPositiveButton("Go", (dialog, which) -> {
+                    try {
+                        onValue.onPercentage(Integer.parseInt(input.getText().toString().trim()));
+                    } catch (NumberFormatException e) {
+                        showStatus("Invalid %");
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    @Override
+    public void confirmExit() {
+        new AlertDialog.Builder(this)
+                .setMessage("Exit Reader?")
+                .setPositiveButton("Yes", (d, w) -> finish())
+                .setNegativeButton("No", null)
+                .show();
+    }
+
+    @Override
+    public void showContents(List<OrgHeading> headings, ContentsCallback onPick) {
+        if (headings.isEmpty()) {
+            showStatus("No sections");
+            return;
+        }
+        String[] labels = new String[headings.size()];
+        for (int i = 0; i < headings.size(); i++) {
+            OrgHeading h = headings.get(i);
+            StringBuilder label = new StringBuilder();
+            for (int indent = 1; indent < h.level; indent++) label.append("  ");
+            label.append(h.title.isEmpty() ? "(untitled)" : h.title);
+            labels[i] = label.toString();
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Contents")
+                .setItems(labels, (dialog, which) -> onPick.onPick(headings.get(which).line))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // ------------------------------------------------------------------ editing
+
+    @Override
+    public void showEditor(String text, int caretOffset) {
+        editInput.setText(text);
+        int caret = Math.max(0, Math.min(caretOffset, editInput.getText().length()));
+        editInput.setSelection(caret);
+        editContainer.setVisibility(View.VISIBLE);
+        editInput.requestFocus();
+    }
+
+    @Override
+    public void hideEditor() {
+        editContainer.setVisibility(View.GONE);
+        listView.requestFocus();
+    }
+
+    @Override
+    public String getEditorText() {
+        return editInput.getText().toString();
+    }
+
+    @Override
+    public void insertAtCursor(String s) {
+        int start = Math.max(0, editInput.getSelectionStart());
+        int end = Math.max(0, editInput.getSelectionEnd());
+        editInput.getText().replace(Math.min(start, end), Math.max(start, end), s);
+    }
+
+    @Override
+    public void confirmEnterEdit(Runnable onConfirm) {
+        new AlertDialog.Builder(this)
+                .setTitle("Edit file?")
+                .setMessage("Saving will overwrite the original file.")
+                .setPositiveButton("Edit", (d, w) -> onConfirm.run())
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    @Override
+    public void confirmSaveOrDiscard(SaveChoiceCallback callback) {
+        new AlertDialog.Builder(this)
+                .setTitle("Unsaved changes")
+                .setMessage("Save before leaving?")
+                .setPositiveButton("Save", (d, w) -> callback.onSave())
+                .setNegativeButton("Discard", (d, w) -> callback.onDiscard())
+                .setNeutralButton("Cancel", (d, w) -> callback.onCancel())
+                .setOnCancelListener(d -> callback.onCancel())
+                .show();
+    }
+}
+package com.sonim.reader.core;
+
+import java.util.List;
+
+/**
+ * Pure bookmark-cursor logic, split out from storage so it can be tested
+ * without Android {@code SharedPreferences}.
+ */
+public final class Bookmarks {
+
+    public static final int NONE = -1;
+
+    /** Lowest slot number (mapped to key {@code 1}). */
+    public static final int MIN_SLOT = 1;
+    /** Highest slot number (mapped to key {@code 9}). */
+    public static final int MAX_SLOT = 9;
+
+    private Bookmarks() {}
+
+    /**
+     * The next bookmark strictly after {@code currentLine}, wrapping to the
+     * first when past the end. Returns {@link #NONE} for an empty slot.
+     * {@code sortedLines} must be ascending.
+     */
+    public static int nextAfter(List<Integer> sortedLines, int currentLine) {
+        if (sortedLines == null || sortedLines.isEmpty()) return NONE;
+        for (int line : sortedLines) {
+            if (line > currentLine) return line;
+        }
+        return sortedLines.get(0);
+    }
+
+    public static boolean isValidSlot(int slot) {
+        return slot >= MIN_SLOT && slot <= MAX_SLOT;
+    }
+}
+package com.sonim.reader.core;
+
+import java.nio.charset.Charset;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Detects the character encoding of a text sample.
+ *
+ * <p>Replaces the old byte-range guess, which flagged any byte in
+ * {@code 0xE0..0xFA} as Hebrew Windows-1255 &mdash; but {@code 0xE0..0xEF} are
+ * exactly the UTF-8 three-byte lead bytes, so every UTF-8 file containing CJK,
+ * symbols or emoji was mis-decoded into mojibake.
+ *
+ * <p>The reliable signal is UTF-8's self-validating structure: real UTF-8 has a
+ * rigid multi-byte grammar that arbitrary Windows-1255 / ISO-8859-1 text almost
+ * never satisfies by accident. So we:
+ * <ol>
+ *   <li>honour a BOM if present (UTF-8 / UTF-16 LE / UTF-16 BE);</li>
+ *   <li>otherwise strictly validate the sample as UTF-8 (tolerating a truncated
+ *       trailing sequence at the sample boundary) and accept UTF-8 if it holds;</li>
+ *   <li>otherwise fall back to Windows-1255 when Hebrew-range bytes are present,
+ *       else ISO-8859-1 (Latin-1), which round-trips every byte.</li>
+ * </ol>
+ * The class is pure and Android-free so it is exhaustively unit-testable.
+ */
+public final class EncodingDetector {
+
+    public static final Charset UTF_8 = Charset.forName("UTF-8");
+    public static final Charset WINDOWS_1255 = Charset.forName("windows-1255");
+    public static final Charset ISO_8859_1 = Charset.forName("ISO-8859-1");
+    public static final Charset UTF_16LE = Charset.forName("UTF-16LE");
+    public static final Charset UTF_16BE = Charset.forName("UTF-16BE");
+
+    /** The encodings the user can manually cycle through, in order. */
+    public static final List<Charset> CYCLE = Arrays.asList(UTF_8, WINDOWS_1255, ISO_8859_1);
+
+    private EncodingDetector() {}
+
+    public static Charset detect(byte[] sample, int length) {
+        if (sample == null || length <= 0) return UTF_8;
+
+        Charset bom = detectBom(sample, length);
+        if (bom != null) return bom;
+
+        if (isValidUtf8(sample, length)) return UTF_8;
+
+        return containsHebrewRange(sample, length) ? WINDOWS_1255 : ISO_8859_1;
+    }
+
+    public static Charset detect(byte[] sample) {
+        return detect(sample, sample == null ? 0 : sample.length);
+    }
+
+    private static Charset detectBom(byte[] b, int len) {
+        if (len >= 3 && u(b[0]) == 0xEF && u(b[1]) == 0xBB && u(b[2]) == 0xBF) return UTF_8;
+        if (len >= 2 && u(b[0]) == 0xFF && u(b[1]) == 0xFE) return UTF_16LE;
+        if (len >= 2 && u(b[0]) == 0xFE && u(b[1]) == 0xFF) return UTF_16BE;
+        return null;
+    }
+
+    /**
+     * Strict UTF-8 structural validation. A sequence cut off at the very end of
+     * the sample (because we only read the first few KB) is treated as valid, so
+     * a legitimate UTF-8 file is never rejected on a buffer boundary.
+     */
+    static boolean isValidUtf8(byte[] b, int len) {
+        int i = 0;
+        while (i < len) {
+            int c = u(b[i]);
+            int trailing;
+            if (c <= 0x7F) {                    // 0xxxxxxx  ASCII
+                trailing = 0;
+            } else if (c >= 0xC2 && c <= 0xDF) { // 110xxxxx  2-byte (0xC0/0xC1 are illegal overlongs)
+                trailing = 1;
+            } else if (c >= 0xE0 && c <= 0xEF) { // 1110xxxx  3-byte
+                trailing = 2;
+            } else if (c >= 0xF0 && c <= 0xF4) { // 11110xxx  4-byte (max U+10FFFF)
+                trailing = 3;
+            } else {
+                return false;                    // stray continuation or illegal lead
+            }
+            for (int j = 1; j <= trailing; j++) {
+                if (i + j >= len) return true;   // truncated at sample end -> assume ok
+                if ((u(b[i + j]) & 0xC0) != 0x80) return false; // must be 10xxxxxx
+            }
+            i += trailing + 1;
+        }
+        return true;
+    }
+
+    private static boolean containsHebrewRange(byte[] b, int len) {
+        for (int i = 0; i < len; i++) {
+            int c = u(b[i]);
+            if (c >= 0xE0 && c <= 0xFA) return true; // Windows-1255 Hebrew letters
+        }
+        return false;
+    }
+
+    private static int u(byte x) {
+        return x & 0xFF;
+    }
+}
+package com.sonim.reader.core;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Remembers which sections are closed and works out which lines are therefore
+ * visible.
+ *
+ * <p>The rule when walking the file top to bottom: a closed title hides every
+ * line under it up to where its section ends. Because a closed parent's section
+ * covers all of its children, closing a parent automatically hides children
+ * too, without having to look at their state.
+ */
+public final class FoldingModel {
+
+    private final OrgOutline outline;
+    private final Set<Integer> closed = new HashSet<>(); // heading indices
+
+    public FoldingModel(OrgOutline outline) {
+        this.outline = outline;
+    }
+
+    public boolean isClosed(int headingIndex) {
+        return closed.contains(headingIndex);
+    }
+
+    public void toggle(int headingIndex) {
+        if (!closed.remove(headingIndex)) closed.add(headingIndex);
+    }
+
+    public void closeAll() {
+        closed.clear();
+        for (int i = 0; i < outline.count(); i++) closed.add(i);
+    }
+
+    public void openAll() {
+        closed.clear();
+    }
+
+    public boolean anyOpen() {
+        return closed.size() < outline.count();
+    }
+
+    /**
+     * Re-opens every section that contains {@code sourceLine} so it can be
+     * shown. Returns true if anything actually changed.
+     */
+    public boolean reveal(int sourceLine) {
+        boolean changed = false;
+        for (int i = 0; i < outline.count(); i++) {
+            if (!closed.contains(i)) continue;
+            int start = outline.headings().get(i).line;
+            int end = outline.sectionEnd(i);
+            if (sourceLine > start && sourceLine < end) {
+                closed.remove(i);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /** The source line numbers currently visible, in order. */
+    public List<Integer> visibleLines() {
+        List<Integer> visible = new ArrayList<>();
+        int skipUntil = -1;
+        int size = outline.totalLines();
+        for (int i = 0; i < size; i++) {
+            if (i < skipUntil) continue;
+            visible.add(i);
+            int headingIndex = outline.headingIndexAtLine(i);
+            if (headingIndex >= 0 && closed.contains(headingIndex)) {
+                skipUntil = outline.sectionEnd(headingIndex);
+            }
+        }
+        return visible;
+    }
+
+    /** Source lines of the titles that are currently closed and on screen. */
+    public Set<Integer> closedHeadingLines() {
+        Set<Integer> result = new HashSet<>();
+        for (int index : closed) {
+            result.add(outline.headings().get(index).line);
+        }
+        return result;
+    }
+
+}
+package com.sonim.reader.core;
+
+/**
+ * Translates between two ways of numbering the same document:
+ * <ul>
+ *   <li><b>source line</b> &mdash; the real line number in the file. Stable; used
+ *       for bookmarks, saved position and search so they survive folding.</li>
+ *   <li><b>display line</b> &mdash; the position in what is currently shown on
+ *       screen, which shrinks when sections are closed.</li>
+ * </ul>
+ * For plain text the two are identical, so {@link #IDENTITY} is used.
+ */
+public interface IndexMap {
+
+    int toSource(int display);
+
+    int toDisplay(int source);
+
+    IndexMap IDENTITY = new IndexMap() {
+        @Override public int toSource(int display) { return display; }
+        @Override public int toDisplay(int source) { return source; }
+    };
+}
+package com.sonim.reader.core;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Simplest {@link LineProvider}: every line materialised in a list.
+ *
+ * <p>Adequate for the XP5s (2&nbsp;GB RAM) and any human-sized text file. The
+ * important property is that it is created off the main thread by
+ * {@link TextLoader}; the old {@code FileBuffer} loaded on the UI thread and
+ * (despite its name) also held the whole file, so this is no worse on memory
+ * and strictly better on responsiveness. Swap for a paged provider if very
+ * large files ever become a requirement.
+ */
+public final class InMemoryLineProvider implements LineProvider {
+
+    private final List<String> lines;
+
+    public InMemoryLineProvider(List<String> lines) {
+        this.lines = new ArrayList<>(lines);
+    }
+
+    @Override
+    public int size() {
+        return lines.size();
+    }
+
+    @Override
+    public String getLine(int index) {
+        return lines.get(index);
+    }
+
+    /** Unmodifiable view, for adapters that want to bind directly to the backing list. */
+    public List<String> asList() {
+        return Collections.unmodifiableList(lines);
+    }
+}
+package com.sonim.reader.core;
+
+/**
+ * Read-only, index-addressable view over the lines of a text document.
+ *
+ * <p>This is the seam that lets the UI stay ignorant of <em>how</em> text is
+ * stored. Today the only implementation is {@link InMemoryLineProvider}, which
+ * holds every line in a list. A future {@code PagedLineProvider} can index line
+ * byte-offsets and decode windows on demand without touching any caller.
+ */
+public interface LineProvider {
+
+    /** Total number of lines. Always {@code >= 1} for a successfully loaded document. */
+    int size();
+
+    /** The line at {@code index}. Callers must pass {@code 0 <= index < size()}. */
+    String getLine(int index);
+
+    /** Clamps {@code percentage} (0-100) to a valid line index. */
+    default int lineForPercentage(int percentage) {
+        if (size() == 0) return 0;
+        float ratio = Math.max(0, Math.min(100, percentage)) / 100f;
+        int target = (int) (size() * ratio);
+        return Math.max(0, Math.min(target, size() - 1));
+    }
+
+    /** The reading progress (0-100) represented by {@code lineIndex}. */
+    default int percentageForLine(int lineIndex) {
+        if (size() == 0) return 0;
+        return (int) (((float) lineIndex / size()) * 100);
+    }
+}
+package com.sonim.reader.core;
+
+/**
+ * One Org title line: which line it is on, how deep it is (number of leading
+ * stars), and the title text with the stars removed.
+ */
+public final class OrgHeading {
+
+    public final int line;
+    public final int level;
+    public final String title;
+
+    public OrgHeading(int line, int level, String title) {
+        this.line = line;
+        this.level = level;
+        this.title = title;
+    }
+}
+package com.sonim.reader.core;
+
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Shows an Org document with closed sections hidden. It wraps the full document
+ * and a list of the currently visible source-line numbers, so the reader can
+ * keep rendering "a list of lines" without knowing anything about folding.
+ *
+ * <p>It also translates between screen position and real file line
+ * ({@link IndexMap}) so bookmarks, saved position and search stay correct when
+ * sections open and close.
+ */
+public final class OrgLineProvider implements LineProvider, IndexMap {
+
+    private static final String CLOSED_MARK = "  ...";
+
+    private final LineProvider full;
+    private final List<Integer> visible;      // display index -> source line
+    private final Set<Integer> closedHeadings; // source lines that are closed titles
+
+    public OrgLineProvider(LineProvider full, List<Integer> visible, Set<Integer> closedHeadings) {
+        this.full = full;
+        this.visible = visible;
+        this.closedHeadings = closedHeadings;
+    }
+
+    @Override
+    public int size() {
+        return visible.size();
+    }
+
+    @Override
+    public String getLine(int display) {
+        int source = visible.get(display);
+        String text = full.getLine(source);
+        return closedHeadings.contains(source) ? text + CLOSED_MARK : text;
+    }
+
+    @Override
+    public int toSource(int display) {
+        if (visible.isEmpty()) return 0;
+        int clamped = Math.max(0, Math.min(display, visible.size() - 1));
+        return visible.get(clamped);
+    }
+
+    /** Nearest visible screen position at or above {@code source}. */
+    @Override
+    public int toDisplay(int source) {
+        int best = 0;
+        for (int d = 0; d < visible.size(); d++) {
+            int line = visible.get(d);
+            if (line == source) return d;
+            if (line < source) best = d;
+            else break;
+        }
+        return best;
+    }
+}
+package com.sonim.reader.core;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * The list of titles in an Org file and how they nest.
+ *
+ * <p>A title is any line that starts with one or more stars followed by a
+ * space, e.g. {@code * Chapter} or {@code ** Section}. The number of stars is
+ * the depth. Everything after a title, up to the next title of the same depth
+ * or shallower, is that title's section.
+ *
+ * <p>Pure Java so it can be unit-tested without a device.
+ */
+public final class OrgOutline {
+
+    private final List<OrgHeading> headings = new ArrayList<>();
+    private final Map<Integer, Integer> lineToIndex = new HashMap<>();
+    private final int totalLines;
+
+    private OrgOutline(int totalLines) {
+        this.totalLines = totalLines;
+    }
+
+    public static OrgOutline parse(LineProvider lines) {
+        OrgOutline outline = new OrgOutline(lines.size());
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.getLine(i);
+            int level = headingLevel(line);
+            if (level > 0) {
+                outline.lineToIndex.put(i, outline.headings.size());
+                outline.headings.add(new OrgHeading(i, level, titleText(line, level)));
+            }
+        }
+        return outline;
+    }
+
+    /** Number of leading stars if {@code line} is a title, else 0. */
+    static int headingLevel(String line) {
+        if (line == null || line.isEmpty() || line.charAt(0) != '*') return 0;
+        int stars = 0;
+        while (stars < line.length() && line.charAt(stars) == '*') stars++;
+        // A real title needs a space after the stars.
+        if (stars < line.length() && line.charAt(stars) == ' ') return stars;
+        return 0;
+    }
+
+    private static String titleText(String line, int level) {
+        return line.substring(level).trim();
+    }
+
+    public int count() {
+        return headings.size();
+    }
+
+    /** Total number of lines in the whole document. */
+    public int totalLines() {
+        return totalLines;
+    }
+
+    public boolean hasHeadings() {
+        return !headings.isEmpty();
+    }
+
+    public List<OrgHeading> headings() {
+        return headings;
+    }
+
+    public boolean isHeadingLine(int line) {
+        return lineToIndex.containsKey(line);
+    }
+
+    /** Heading index of the title exactly on {@code line}, or -1. */
+    public int headingIndexAtLine(int line) {
+        Integer idx = lineToIndex.get(line);
+        return idx == null ? -1 : idx;
+    }
+
+    /** The section {@code line} belongs to: the last title at or above it, or -1. */
+    public int sectionOf(int line) {
+        int result = -1;
+        for (int i = 0; i < headings.size(); i++) {
+            if (headings.get(i).line <= line) result = i;
+            else break;
+        }
+        return result;
+    }
+
+    /** First line NOT part of heading {@code index}'s section (exclusive end). */
+    public int sectionEnd(int index) {
+        int level = headings.get(index).level;
+        for (int i = index + 1; i < headings.size(); i++) {
+            if (headings.get(i).level <= level) return headings.get(i).line;
+        }
+        return totalLines;
+    }
+
+    /** First title strictly after {@code line}, or -1. */
+    public int nextHeadingLine(int line) {
+        for (OrgHeading h : headings) {
+            if (h.line > line) return h.line;
+        }
+        return -1;
+    }
+
+    /** Last title strictly before {@code line}, or -1. */
+    public int previousHeadingLine(int line) {
+        int result = -1;
+        for (OrgHeading h : headings) {
+            if (h.line < line) result = h.line;
+            else break;
+        }
+        return result;
+    }
+}
+package com.sonim.reader.core;
+
+import java.nio.charset.Charset;
+
+/**
+ * Mutable, framework-free bundle of display preferences. The adapter reads this
+ * live, so appearance changes (font, theme, direction) re-render in place
+ * instead of rebuilding the list &mdash; which is what used to throw the reader
+ * back to the top of the book.
+ */
+public final class ReaderSettings {
+
+    public static final float MIN_FONT = 10f;
+    public static final float MAX_FONT = 40f;
+    public static final float DEFAULT_FONT = 18f;
+    private static final float FONT_STEP = 2f;
+
+    private float fontSize = DEFAULT_FONT;
+    private boolean nightMode = true;
+    private boolean rtl = false;
+    private int encodingIndex = 0; // index into EncodingDetector.CYCLE
+
+    public float getFontSize() { return fontSize; }
+
+    public void increaseFont() { fontSize = Math.min(MAX_FONT, fontSize + FONT_STEP); }
+
+    public void decreaseFont() { fontSize = Math.max(MIN_FONT, fontSize - FONT_STEP); }
+
+    public void setFontSize(float size) {
+        fontSize = Math.max(MIN_FONT, Math.min(MAX_FONT, size));
+    }
+
+    public boolean isNightMode() { return nightMode; }
+
+    public void toggleNightMode() { nightMode = !nightMode; }
+
+    public void setNightMode(boolean night) { this.nightMode = night; }
+
+    public boolean isRtl() { return rtl; }
+
+    public void setRtl(boolean rtl) { this.rtl = rtl; }
+
+    public void toggleRtl() { rtl = !rtl; }
+
+    public int getEncodingIndex() { return encodingIndex; }
+
+    public void setEncodingIndex(int index) {
+        int n = EncodingDetector.CYCLE.size();
+        this.encodingIndex = ((index % n) + n) % n;
+    }
+
+    public void cycleEncoding() { setEncodingIndex(encodingIndex + 1); }
+
+    public Charset getCharset() { return EncodingDetector.CYCLE.get(encodingIndex); }
+
+    public String getEncodingName() { return getCharset().name(); }
+}
+package com.sonim.reader.core;
+
+/**
+ * Heuristic right-to-left detection. Scans the opening lines for Hebrew and
+ * Arabic letters rather than sampling a single line, so short front-matter
+ * (title, blank lines) doesn't cause a mis-guess. The user can always override
+ * with a long-press on 0. Ranges are given as code points to keep the source
+ * pure ASCII.
+ */
+public final class RtlDetector {
+
+    private static final int LINES_TO_SCAN = 40;
+
+    private RtlDetector() {}
+
+    public static boolean isProbablyRtl(LineProvider lines) {
+        if (lines == null) return false;
+        int scan = Math.min(LINES_TO_SCAN, lines.size());
+        for (int i = 0; i < scan; i++) {
+            if (containsRtlLetter(lines.getLine(i))) return true;
+        }
+        return false;
+    }
+
+    static boolean containsRtlLetter(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < s.length(); i++) {
+            int c = s.charAt(i);
+            if (c >= 0x0590 && c <= 0x05FF) return true; // Hebrew
+            if (c >= 0x0600 && c <= 0x06FF) return true; // Arabic
+            if (c >= 0x0750 && c <= 0x077F) return true; // Arabic Supplement
+            if (c >= 0xFB1D && c <= 0xFDFF) return true; // Hebrew + Arabic Presentation Forms-A
+            if (c >= 0xFE70 && c <= 0xFEFF) return true; // Arabic Presentation Forms-B
+        }
+        return false;
+    }
+}
+package com.sonim.reader.core;
+
+import java.util.Locale;
+
+/**
+ * Case-insensitive line search over a {@link LineProvider}, with wrap-around.
+ *
+ * <p>Pure and stateless (the caller owns the "current match" cursor), so it is
+ * trivially unit-testable and reusable by any UI.
+ */
+public final class SearchService {
+
+    /** Sentinel for "no match". */
+    public static final int NOT_FOUND = -1;
+
+    private SearchService() {}
+
+    /** First match at or after {@code fromLine}, wrapping to the top. */
+    public static int findNext(LineProvider lines, String query, int fromLine) {
+        if (isBlank(query) || lines.size() == 0) return NOT_FOUND;
+        String needle = query.toLowerCase(Locale.ROOT);
+        int start = clamp(fromLine, lines.size());
+        for (int i = start; i < lines.size(); i++) {
+            if (contains(lines.getLine(i), needle)) return i;
+        }
+        for (int i = 0; i < start; i++) {
+            if (contains(lines.getLine(i), needle)) return i;
+        }
+        return NOT_FOUND;
+    }
+
+    /** First match strictly before {@code fromLine}, wrapping to the bottom. */
+    public static int findPrevious(LineProvider lines, String query, int fromLine) {
+        if (isBlank(query) || lines.size() == 0) return NOT_FOUND;
+        String needle = query.toLowerCase(Locale.ROOT);
+        int start = clamp(fromLine, lines.size());
+        for (int i = start - 1; i >= 0; i--) {
+            if (contains(lines.getLine(i), needle)) return i;
+        }
+        for (int i = lines.size() - 1; i >= start; i--) {
+            if (contains(lines.getLine(i), needle)) return i;
+        }
+        return NOT_FOUND;
+    }
+
+    /** Total number of lines containing {@code query}. */
+    public static int count(LineProvider lines, String query) {
+        if (isBlank(query)) return 0;
+        String needle = query.toLowerCase(Locale.ROOT);
+        int n = 0;
+        for (int i = 0; i < lines.size(); i++) {
+            if (contains(lines.getLine(i), needle)) n++;
+        }
+        return n;
+    }
+
+    private static boolean contains(String line, String lowerNeedle) {
+        return line != null && line.toLowerCase(Locale.ROOT).contains(lowerNeedle);
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
+
+    private static int clamp(int i, int size) {
+        if (i < 0) return 0;
+        if (i > size) return size;
+        return i;
+    }
+}
+package com.sonim.reader.core;
+
+import java.io.IOException;
+import java.io.InputStream;
+
+/**
+ * Supplies a fresh {@link InputStream} over some byte source.
+ *
+ * <p>Decouples {@link TextLoader} and {@link EncodingDetector} from Android's
+ * {@code ContentResolver}: production code passes a resolver-backed opener,
+ * unit tests pass a {@code byte[]}-backed one. Each call must return a new,
+ * independent stream positioned at the start.
+ */
+public interface StreamOpener {
+    InputStream open() throws IOException;
+}
+package com.sonim.reader.core;
+
+import java.io.IOException;
+import java.io.OutputStream;
+
+/**
+ * Supplies a fresh {@link OutputStream} to some byte sink &mdash; the write-side
+ * mirror of {@link StreamOpener}.
+ *
+ * <p>Decouples {@link TextWriter} from Android's {@code ContentResolver} and the
+ * filesystem: production code passes a file- or resolver-backed sink, unit tests
+ * pass a {@code ByteArrayOutputStream}-backed one. Each call must return a new
+ * stream positioned at the start (truncating any existing content).
+ */
+public interface StreamWriter {
+    OutputStream open() throws IOException;
+}
+package com.sonim.reader.core;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Loads a text document into an {@link InMemoryLineProvider}.
+ *
+ * <p>Pure and Android-free: it reads whatever {@link StreamOpener} hands it,
+ * which is what makes both encoding detection and line loading unit-testable
+ * without a device. Always call this off the main thread.
+ */
+public final class TextLoader {
+
+    private static final int SAMPLE_BYTES = 8192;
+
+    private TextLoader() {}
+
+    /** Reads the leading bytes used for encoding detection. */
+    public static byte[] readSample(StreamOpener opener) throws IOException {
+        byte[] buffer = new byte[SAMPLE_BYTES];
+        int total = 0;
+        try (InputStream in = new BufferedInputStream(opener.open())) {
+            int read;
+            while (total < buffer.length
+                    && (read = in.read(buffer, total, buffer.length - total)) != -1) {
+                total += read;
+            }
+        }
+        if (total == buffer.length) return buffer;
+        byte[] trimmed = new byte[total];
+        System.arraycopy(buffer, 0, trimmed, 0, total);
+        return trimmed;
+    }
+
+    /** Detects the encoding, then loads every line with it. */
+    public static LineProvider loadAutoDetect(StreamOpener opener) throws IOException {
+        Charset charset = EncodingDetector.detect(readSample(opener));
+        return load(opener, charset);
+    }
+
+    /** Loads every line using an explicit {@code charset}. */
+    public static LineProvider load(StreamOpener opener, Charset charset) throws IOException {
+        List<String> lines = new ArrayList<>();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(opener.open(), charset))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lines.add(line);
+            }
+        }
+        if (lines.isEmpty()) lines.add(""); // never expose an empty document
+        return new InMemoryLineProvider(lines);
+    }
+}
+package com.sonim.reader.core;
+
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Serialises editor text back to bytes &mdash; the write-side mirror of
+ * {@link TextLoader}. Pure and Android-free so the whole round trip
+ * (load &rarr; edit &rarr; save) is unit-testable without a device.
+ *
+ * <p>The mapping is deliberately WYSIWYG: the text shown in the editor is
+ * exactly what lands on disk. Lines are joined by {@code '\n'} with no forced
+ * trailing newline, so what the user sees is what is saved.
+ */
+public final class TextWriter {
+
+    private TextWriter() {}
+
+    /** Joins {@code lines} with {@code '\n'} into the exact text shown in the editor. */
+    public static String serialize(List<String> lines) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < lines.size(); i++) {
+            if (i > 0) sb.append('\n');
+            sb.append(lines.get(i));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Splits editor text back into lines, tolerant of {@code \n}, {@code \r\n}
+     * and lone {@code \r}. A trailing newline yields a final empty line, so
+     * {@code split(serialize(x)).equals(x)} for any {@code x}.
+     */
+    public static List<String> split(String text) {
+        List<String> out = new ArrayList<>();
+        if (text == null) {
+            out.add("");
+            return out;
+        }
+        int start = 0;
+        int n = text.length();
+        for (int i = 0; i < n; i++) {
+            char c = text.charAt(i);
+            if (c == '\n' || c == '\r') {
+                out.add(text.substring(start, i));
+                if (c == '\r' && i + 1 < n && text.charAt(i + 1) == '\n') i++;
+                start = i + 1;
+            }
+        }
+        out.add(text.substring(start));
+        return out;
+    }
+
+    /** Writes {@code lines} to {@code target} using {@code charset}. Always off the main thread. */
+    public static void writeTo(StreamWriter target, List<String> lines, Charset charset)
+            throws IOException {
+        try (Writer w = new OutputStreamWriter(
+                new BufferedOutputStream(target.open()), charset)) {
+            w.write(serialize(lines));
+        }
+    }
+}
+package com.sonim.reader.data;
+
+import java.util.List;
+
+/**
+ * Persistence boundary for per-file bookmark slots. Depending on this interface
+ * (not {@code SharedPreferences} directly) lets the controller be tested with a
+ * fake and lets storage be swapped later (e.g. a file/db).
+ */
+public interface BookmarkRepository {
+
+    /** Appends {@code line} to {@code slot} (1-9) for {@code fileKey}. */
+    void add(String fileKey, int slot, int line);
+
+    /** All lines saved in {@code slot}, ascending. Never null. */
+    List<Integer> get(String fileKey, int slot);
+
+    /** Removes every slot for {@code fileKey}. */
+    void clear(String fileKey);
+}
+package com.sonim.reader.data;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+import com.sonim.reader.core.Bookmarks;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/** {@link SharedPreferences}-backed {@link BookmarkRepository}. */
+public final class PrefsBookmarkRepository implements BookmarkRepository {
+
+    private static final String PREF_NAME = "ReaderBookmarks";
+
+    private final SharedPreferences prefs;
+
+    public PrefsBookmarkRepository(Context context) {
+        this.prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+    }
+
+    private static String key(String fileKey, int slot) {
+        return fileKey + "_slot_" + slot;
+    }
+
+    @Override
+    public void add(String fileKey, int slot, int line) {
+        String k = key(fileKey, slot);
+        // Copy the returned set before mutating: the instance from SharedPreferences must not be edited in place.
+        Set<String> set = new HashSet<>(prefs.getStringSet(k, new HashSet<>()));
+        set.add(String.valueOf(line));
+        prefs.edit().putStringSet(k, set).apply();
+    }
+
+    @Override
+    public List<Integer> get(String fileKey, int slot) {
+        Set<String> raw = prefs.getStringSet(key(fileKey, slot), new HashSet<>());
+        List<Integer> lines = new ArrayList<>(raw.size());
+        for (String s : raw) {
+            try {
+                lines.add(Integer.parseInt(s));
+            } catch (NumberFormatException ignored) {
+                // skip corrupt entry
+            }
+        }
+        Collections.sort(lines);
+        return lines;
+    }
+
+    @Override
+    public void clear(String fileKey) {
+        SharedPreferences.Editor editor = prefs.edit();
+        for (int slot = Bookmarks.MIN_SLOT; slot <= Bookmarks.MAX_SLOT; slot++) {
+            editor.remove(key(fileKey, slot));
+        }
+        editor.apply();
+    }
+}
+package com.sonim.reader.data;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
+
+/** {@link SharedPreferences}-backed {@link ReadingStateStore}. */
+public final class PrefsReadingStateStore implements ReadingStateStore {
+
+    private static final String PREF_NAME = "ReaderPrefs";
+    private static final String KEY_RECENTS = "recent_files";
+    private static final String RECENTS_SEP = "\n";
+    private static final int MAX_RECENTS = 15;
+
+    private final SharedPreferences prefs;
+
+    public PrefsReadingStateStore(Context context) {
+        this.prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+    }
+
+    @Override
+    public int getPosition(String fileKey, int fallback) {
+        return prefs.getInt(fileKey + "_pos", fallback);
+    }
+
+    @Override
+    public void savePosition(String fileKey, int line) {
+        prefs.edit().putInt(fileKey + "_pos", line).apply();
+    }
+
+    @Override
+    public int getEncodingIndex(String fileKey, int fallback) {
+        return prefs.getInt(fileKey + "_enc", fallback);
+    }
+
+    @Override
+    public void saveEncodingIndex(String fileKey, int index) {
+        prefs.edit().putInt(fileKey + "_enc", index).apply();
+    }
+
+    @Override
+    public boolean getRtl(String fileKey, boolean fallback) {
+        return prefs.getBoolean(fileKey + "_rtl", fallback);
+    }
+
+    @Override
+    public void saveRtl(String fileKey, boolean rtl) {
+        prefs.edit().putBoolean(fileKey + "_rtl", rtl).apply();
+    }
+
+    @Override
+    public List<String> getRecentFiles() {
+        String raw = prefs.getString(KEY_RECENTS, "");
+        if (raw.isEmpty()) return new ArrayList<>();
+        return new ArrayList<>(Arrays.asList(raw.split(RECENTS_SEP)));
+    }
+
+    @Override
+    public void addRecentFile(String uri) {
+        // LinkedHashSet keeps insertion order and de-dupes; newest goes first.
+        LinkedHashSet<String> ordered = new LinkedHashSet<>();
+        ordered.add(uri);
+        ordered.addAll(getRecentFiles());
+        List<String> trimmed = new ArrayList<>(ordered);
+        if (trimmed.size() > MAX_RECENTS) {
+            trimmed = trimmed.subList(0, MAX_RECENTS);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < trimmed.size(); i++) {
+            if (i > 0) sb.append(RECENTS_SEP);
+            sb.append(trimmed.get(i));
+        }
+        prefs.edit().putString(KEY_RECENTS, sb.toString()).apply();
+    }
+}
+package com.sonim.reader.data;
+
+/**
+ * Persists lightweight per-file reading state: last line position, and the
+ * remembered encoding / direction overrides so reopening a book restores
+ * exactly how you left it.
+ */
+public interface ReadingStateStore {
+
+    int getPosition(String fileKey, int fallback);
+
+    void savePosition(String fileKey, int line);
+
+    /** Remembered encoding index, or {@code fallback} if the user never set one. */
+    int getEncodingIndex(String fileKey, int fallback);
+
+    void saveEncodingIndex(String fileKey, int index);
+
+    boolean getRtl(String fileKey, boolean fallback);
+
+    void saveRtl(String fileKey, boolean rtl);
+
+    /** Most-recently opened file URIs, newest first. */
+    java.util.List<String> getRecentFiles();
+
+    void addRecentFile(String uri);
+}
+package com.sonim.reader.ui;
+
+import android.os.Handler;
+import android.os.Looper;
+
+/** {@link MainThread} backed by a main-looper {@link Handler}. */
+public final class AndroidMainThread implements MainThread {
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+
+    @Override
+    public void post(Runnable action) {
+        handler.post(action);
+    }
+
+    @Override
+    public void postDelayed(Runnable action, long delayMillis) {
+        handler.postDelayed(action, delayMillis);
+    }
+
+    @Override
+    public void cancel(Runnable action) {
+        handler.removeCallbacks(action);
+    }
+}
+package com.sonim.reader.ui;
+
+import android.content.Context;
+import android.net.Uri;
+
+import com.sonim.reader.core.TextWriter;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.Charset;
+import java.util.List;
+
+/**
+ * {@link DocumentSaver} that overwrites the original file <em>in place</em>.
+ *
+ * <p>For {@code file://} URIs (what the built-in picker produces) it writes to a
+ * hidden temp file in the same directory and then renames it over the original,
+ * so a crash mid-write can never leave a half-written, corrupted document. For
+ * {@code content://} URIs it falls back to the Storage Access Framework's
+ * truncating output stream.
+ */
+public final class AtomicFileSaver implements DocumentSaver {
+
+    private final Context context;
+    private final Uri uri;
+
+    public AtomicFileSaver(Context context, Uri uri) {
+        this.context = context.getApplicationContext();
+        this.uri = uri;
+    }
+
+    @Override
+    public void save(List<String> lines, Charset charset) throws IOException {
+        String path = "file".equalsIgnoreCase(uri.getScheme()) ? uri.getPath() : null;
+        if (path != null) {
+            saveFileAtomic(new File(path), lines, charset);
+        } else {
+            saveViaResolver(lines, charset);
+        }
+    }
+
+    private void saveFileAtomic(File dest, List<String> lines, Charset charset) throws IOException {
+        File dir = dest.getParentFile();
+        if (dir == null) throw new IOException("No parent directory for " + dest);
+        final File tmp = new File(dir, "." + dest.getName() + ".tmp");
+        TextWriter.writeTo(() -> new FileOutputStream(tmp), lines, charset);
+        if (!tmp.renameTo(dest)) {
+            // Rename can fail across some filesystems; fall back to a direct overwrite.
+            TextWriter.writeTo(() -> new FileOutputStream(dest), lines, charset);
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+        }
+    }
+
+    private void saveViaResolver(List<String> lines, Charset charset) throws IOException {
+        TextWriter.writeTo(() -> {
+            OutputStream os = context.getContentResolver().openOutputStream(uri, "wt");
+            if (os == null) throw new IOException("Cannot open output stream for " + uri);
+            return os;
+        }, lines, charset);
+    }
+}
+package com.sonim.reader.ui;
+
+import android.content.Context;
+import android.net.Uri;
+
+import com.sonim.reader.core.StreamOpener;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+
+/**
+ * {@link StreamOpener} backed by Android's {@code ContentResolver}. Works for
+ * both {@code file://} URIs (from the built-in picker) and {@code content://}
+ * URIs (from the Storage Access Framework), so the loading core never has to
+ * know which one it got.
+ */
+public final class ContentStreamOpener implements StreamOpener {
+
+    private final Context context;
+    private final Uri uri;
+
+    public ContentStreamOpener(Context context, Uri uri) {
+        this.context = context.getApplicationContext();
+        this.uri = uri;
+    }
+
+    @Override
+    public InputStream open() throws IOException {
+        InputStream in = context.getContentResolver().openInputStream(uri);
+        if (in == null) {
+            throw new FileNotFoundException("Could not open stream for " + uri);
+        }
+        return in;
+    }
+}
+package com.sonim.reader.ui;
+
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.util.List;
+
+/**
+ * Persists the edited document back to its source. An Android-free seam (like
+ * {@link ReaderView} and {@link MainThread}) so {@link ReaderController} can
+ * save without knowing about {@code Uri}s, files, or {@code ContentResolver}.
+ * The app binds an {@link AtomicFileSaver}; tests can bind a fake.
+ */
+public interface DocumentSaver {
+
+    /** Overwrites the source with {@code lines} encoded as {@code charset}. */
+    void save(List<String> lines, Charset charset) throws IOException;
+}
+package com.sonim.reader.ui;
+
+import android.view.KeyEvent;
+
+/**
+ * Single translation point from XP5s physical keys to {@link ReaderController}
+ * actions. New bindings are added here without touching the Activity or the
+ * controller.
+ *
+ * <p>Plain-text key map:
+ * <pre>
+ *   Volume +/-      font larger / smaller
+ *   OK / Center tap toggle search box
+ *   OK / Center hold enter the editor (after a confirm prompt)
+ *   D-pad up/down   scroll line by line (handled by the list itself)
+ *   D-pad left/rt   page up / down   (in search: previous / next match)
+ *   5               toggle night mode
+ *   #               cycle text encoding
+ *   *               toggle time/battery/progress HUD
+ *   Menu            toggle auto-scroll
+ *   1-9 tap         jump to next bookmark in that slot
+ *   1-9 long-press  save a bookmark to that slot
+ *   0 tap           jump to percentage
+ *   0 long-press    toggle reading direction (RTL/LTR)
+ * </pre>
+ *
+ * <p>Extra bindings that switch on ONLY for .org files (everything else is
+ * unchanged):
+ * <pre>
+ *   D-pad left/rt   previous / next title
+ *   * tap           close / open the current section
+ *   * long-press    close all / open all sections
+ *   Menu tap        open the Contents list
+ *   Menu long-press time/battery/progress HUD
+ * </pre>
+ *
+ * <p>While the editor is open, key handling is entirely different &mdash; see
+ * {@link #onEditKey(KeyEvent)}. Character entry and caret movement are left to
+ * the native editable field; only the control keys are intercepted here.
+ */
+public final class KeyCommandRouter {
+
+    private final ReaderController controller;
+    private final ReaderView view;
+
+    public KeyCommandRouter(ReaderController controller, ReaderView view) {
+        this.controller = controller;
+        this.view = view;
+    }
+
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        // Number keys, OK/Center, and (in Org mode) * and Menu, need
+        // tap-vs-long-press, so they start tracking and act on key-up /
+        // long-press instead.
+        if (isNumberKey(keyCode)) {
+            event.startTracking();
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+            event.startTracking();
+            return true;
+        }
+        if (controller.isOrgMode()
+                && (keyCode == KeyEvent.KEYCODE_STAR || keyCode == KeyEvent.KEYCODE_MENU)) {
+            event.startTracking();
+            return true;
+        }
+
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_VOLUME_UP:
+                controller.increaseFont();
+                return true;
+            case KeyEvent.KEYCODE_VOLUME_DOWN:
+                controller.decreaseFont();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                if (view.isSearchVisible()) controller.searchNext();
+                else if (controller.isOrgMode()) controller.nextHeading();
+                else controller.pageDown();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+                if (view.isSearchVisible()) controller.searchPrevious();
+                else if (controller.isOrgMode()) controller.previousHeading();
+                else controller.pageUp();
+                return true;
+            case KeyEvent.KEYCODE_5:
+                controller.toggleNightMode();
+                return true;
+            case KeyEvent.KEYCODE_POUND:
+                controller.cycleEncoding();
+                return true;
+            case KeyEvent.KEYCODE_STAR:
+                controller.toggleHud(); // plain-text only (Org handled above)
+                return true;
+            case KeyEvent.KEYCODE_MENU:
+                controller.toggleAutoScroll(); // plain-text only (Org handled above)
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public boolean onKeyLongPress(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+            controller.requestEditMode();
+            return true;
+        }
+        if (isSlotKey(keyCode)) {
+            controller.saveBookmark(slotOf(keyCode));
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_0) {
+            controller.toggleRtl();
+            return true;
+        }
+        if (controller.isOrgMode()) {
+            if (keyCode == KeyEvent.KEYCODE_STAR) {
+                controller.toggleFoldAll();
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_MENU) {
+                controller.toggleHud();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        // A long-press already handled this key; swallow the trailing up event.
+        boolean deferred = isNumberKey(keyCode)
+                || keyCode == KeyEvent.KEYCODE_DPAD_CENTER
+                || keyCode == KeyEvent.KEYCODE_ENTER
+                || (controller.isOrgMode()
+                    && (keyCode == KeyEvent.KEYCODE_STAR || keyCode == KeyEvent.KEYCODE_MENU));
+        if (deferred && event.isCanceled()) {
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+            controller.toggleSearch();
+            return true;
+        }
+        if (isSlotKey(keyCode)) {
+            controller.gotoBookmark(slotOf(keyCode));
+            return true;
+        }
+        if (keyCode == KeyEvent.KEYCODE_0) {
+            controller.promptJumpToPercentage();
+            return true;
+        }
+        if (controller.isOrgMode()) {
+            if (keyCode == KeyEvent.KEYCODE_STAR) {
+                controller.toggleFoldCurrent();
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_MENU) {
+                controller.openContents();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The editor's own key map, consulted only while the editor is open. Returns
+     * {@code true} for the three control keys it owns and {@code false} for
+     * everything else, so ordinary typing and D-pad caret movement flow straight
+     * through to the native editable field.
+     *
+     * <pre>
+     *   Back    leave the editor (prompts to save if there are changes)
+     *   Menu    save (overwrite the file in place)
+     *   OK      insert a newline at the caret
+     * </pre>
+     */
+    public boolean onEditKey(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        boolean up = event.getAction() == KeyEvent.ACTION_UP;
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BACK:
+                if (up) controller.exitEditRequested();
+                return true;
+            case KeyEvent.KEYCODE_MENU:
+                if (up) controller.saveEditsFromEditor();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+                if (!up && event.getRepeatCount() == 0) controller.insertNewlineInEditor();
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static boolean isNumberKey(int keyCode) {
+        return keyCode >= KeyEvent.KEYCODE_0 && keyCode <= KeyEvent.KEYCODE_9;
+    }
+
+    private static boolean isSlotKey(int keyCode) {
+        return keyCode >= KeyEvent.KEYCODE_1 && keyCode <= KeyEvent.KEYCODE_9;
+    }
+
+    private static int slotOf(int keyCode) {
+        return keyCode - KeyEvent.KEYCODE_1 + 1;
+    }
+}
+package com.sonim.reader.ui;
+
+import android.content.Context;
+import android.graphics.Color;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
+import android.widget.TextView;
+
+import com.sonim.reader.core.LineProvider;
+import com.sonim.reader.core.ReaderSettings;
+
+/**
+ * Renders lines using the <em>live</em> {@link ReaderSettings}, so a font,
+ * theme, or direction change is applied with {@code notifyDataSetChanged()}
+ * instead of rebuilding the list. That is the fix for the old bug where every
+ * appearance toggle threw the reader back to the top of the book.
+ */
+public final class LineAdapter extends ArrayAdapter<String> {
+
+    private final LineProvider lines;
+    private final ReaderSettings settings;
+
+    public LineAdapter(Context context, LineProvider lines, ReaderSettings settings) {
+        super(context, 0);
+        this.lines = lines;
+        this.settings = settings;
+    }
+
+    @Override
+    public int getCount() {
+        return lines.size();
+    }
+
+    @Override
+    public String getItem(int position) {
+        return lines.getLine(position);
+    }
+
+    @Override
+    public View getView(int position, View convertView, ViewGroup parent) {
+        TextView tv = (TextView) convertView;
+        if (tv == null) {
+            tv = new TextView(getContext());
+            tv.setPadding(12, 6, 12, 6);
+        }
+        tv.setText(lines.getLine(position));
+        tv.setTextSize(settings.getFontSize());
+        tv.setTextColor(settings.isNightMode() ? Color.WHITE : Color.BLACK);
+        tv.setTextDirection(settings.isRtl() ? View.TEXT_DIRECTION_RTL : View.TEXT_DIRECTION_LTR);
+        tv.setGravity(settings.isRtl() ? Gravity.RIGHT : Gravity.LEFT);
+        return tv;
+    }
+}
+package com.sonim.reader.ui;
+
+/**
+ * Minimal main-thread scheduler abstraction so {@link ReaderController} can post
+ * work back to the UI thread (and drive auto-scroll) without a hard dependency
+ * on {@code android.os.Handler}. Backed by {@link AndroidMainThread} in the app.
+ */
+public interface MainThread {
+
+    void post(Runnable action);
+
+    void postDelayed(Runnable action, long delayMillis);
+
+    void cancel(Runnable action);
+}
+package com.sonim.reader.ui;
+
+import com.sonim.reader.core.Bookmarks;
+import com.sonim.reader.core.EncodingDetector;
+import com.sonim.reader.core.FoldingModel;
+import com.sonim.reader.core.IndexMap;
+import com.sonim.reader.core.InMemoryLineProvider;
+import com.sonim.reader.core.LineProvider;
+import com.sonim.reader.core.OrgLineProvider;
+import com.sonim.reader.core.OrgOutline;
+import com.sonim.reader.core.ReaderSettings;
+import com.sonim.reader.core.RtlDetector;
+import com.sonim.reader.core.SearchService;
+import com.sonim.reader.core.StreamOpener;
+import com.sonim.reader.core.TextLoader;
+import com.sonim.reader.core.TextWriter;
+import com.sonim.reader.data.BookmarkRepository;
+import com.sonim.reader.data.ReadingStateStore;
+
+import java.nio.charset.Charset;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.Executor;
+
+/**
+ * Owns all reader behaviour. The Activity forwards key events here and renders
+ * what it is told through {@link ReaderView}.
+ *
+ * <p>Positions travel in two forms. Everything the user cares about keeping
+ * &mdash; bookmarks, saved place, search &mdash; is stored as a real <b>file
+ * line</b> (called "source" here). What is on screen is a <b>display line</b>,
+ * which shifts when Org sections are closed. {@link #map} converts between them,
+ * so folding never corrupts a bookmark or a saved place. For plain text the two
+ * are the same, so {@code map} is {@link IndexMap#IDENTITY}.
+ */
+public final class ReaderController {
+
+    private static final long AUTO_SCROLL_INTERVAL_MS = 1400;
+
+    private final ReaderView view;
+    private final BookmarkRepository bookmarks;
+    private final ReadingStateStore state;
+    private final Executor background;
+    private final MainThread main;
+    private final ReaderSettings settings = new ReaderSettings();
+
+    private LineProvider rawLines;   // the whole file, real line numbers
+    private LineProvider lines;      // what is shown (folded view in Org mode)
+    private IndexMap map = IndexMap.IDENTITY;
+    private StreamOpener opener;
+    private DocumentSaver saver;
+    private String fileKey;
+
+    private boolean editing = false;
+    private String savedText = "";   // editor text as last written, for dirty checks
+    private int editReturnSource = 0; // reading position to restore on leaving the editor
+
+    private boolean orgMode = false;
+    private OrgOutline outline;
+    private FoldingModel folding;
+
+    private String currentQuery = "";
+    private int lastMatchSource = SearchService.NOT_FOUND;
+
+    private boolean autoScrolling = false;
+    private final Runnable autoScrollTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!autoScrolling || lines == null) return;
+            int next = view.getTopLine() + 1;
+            if (next >= lines.size() - 1) {
+                stopAutoScroll();
+                return;
+            }
+            view.scrollToLine(next);
+            main.postDelayed(this, AUTO_SCROLL_INTERVAL_MS);
+        }
+    };
+
+    public ReaderController(ReaderView view,
+                            BookmarkRepository bookmarks,
+                            ReadingStateStore state,
+                            Executor background,
+                            MainThread main) {
+        this.view = view;
+        this.bookmarks = bookmarks;
+        this.state = state;
+        this.background = background;
+        this.main = main;
+    }
+
+    public ReaderSettings settings() {
+        return settings;
+    }
+
+    public boolean hasDocument() {
+        return rawLines != null;
+    }
+
+    public boolean isOrgMode() {
+        return orgMode;
+    }
+
+    public boolean isEditing() {
+        return editing;
+    }
+
+    // ---------------------------------------------------------------- loading
+
+    public void load(String fileKey, StreamOpener opener, DocumentSaver saver) {
+        this.fileKey = fileKey;
+        this.opener = opener;
+        this.saver = saver;
+        background.execute(() -> {
+            try {
+                int rememberedEnc = state.getEncodingIndex(fileKey, -1);
+                LineProvider loaded;
+                if (rememberedEnc >= 0) {
+                    settings.setEncodingIndex(rememberedEnc);
+                    loaded = TextLoader.load(opener, settings.getCharset());
+                } else {
+                    Charset detected = EncodingDetector.detect(TextLoader.readSample(opener));
+                    int idx = EncodingDetector.CYCLE.indexOf(detected);
+                    settings.setEncodingIndex(Math.max(0, idx));
+                    loaded = TextLoader.load(opener, idx >= 0 ? settings.getCharset() : detected);
+                }
+                final boolean rtl = state.getRtl(fileKey, RtlDetector.isProbablyRtl(loaded));
+                final int savedPos = state.getPosition(fileKey, 0);
+                final LineProvider raw = loaded;
+                main.post(() -> {
+                    settings.setRtl(rtl);
+                    buildAndShow(raw, savedPos, true);
+                    state.addRecentFile(fileKey);
+                });
+            } catch (Exception e) {
+                main.post(() -> view.showStatus("Cannot open file"));
+            }
+        });
+    }
+
+    /** Builds the shown view (Org or plain) from a freshly loaded document. */
+    private void buildAndShow(LineProvider raw, int sourcePos, boolean announce) {
+        rawLines = raw;
+        outline = isOrgFile() ? OrgOutline.parse(raw) : null;
+        orgMode = outline != null && outline.hasHeadings();
+        if (orgMode) {
+            folding = new FoldingModel(outline);
+            applyOrgView();
+        } else {
+            lines = raw;
+            map = IndexMap.IDENTITY;
+            view.showDocument(raw, settings);
+        }
+        goToSource(clampSource(sourcePos));
+        if (announce && orgMode) {
+            view.showStatus("Org: * fold   < > titles   Menu contents");
+        }
+    }
+
+    /** Rebuilds the folded view from the current fold state and shows it. */
+    private void applyOrgView() {
+        List<Integer> visible = folding.visibleLines();
+        OrgLineProvider provider = new OrgLineProvider(rawLines, visible, folding.closedHeadingLines());
+        lines = provider;
+        map = provider;
+        view.showDocument(provider, settings);
+    }
+
+    private boolean isOrgFile() {
+        return fileKey != null && fileKey.toLowerCase(Locale.ROOT).endsWith(".org");
+    }
+
+    private int clampSource(int source) {
+        if (rawLines == null || rawLines.size() == 0) return 0;
+        return Math.max(0, Math.min(source, rawLines.size() - 1));
+    }
+
+    // --------------------------------------------------- position translation
+
+    private int currentSource() {
+        return map.toSource(view.getTopLine());
+    }
+
+    /** Reveal a file line (opening any closed sections around it) and scroll to it. */
+    private void goToSource(int source) {
+        if (orgMode) {
+            if (folding.reveal(source)) applyOrgView();
+            view.scrollToLine(map.toDisplay(source));
+        } else {
+            view.scrollToLine(source);
+        }
+    }
+
+    // ------------------------------------------------------------ appearance
+
+    public void increaseFont() {
+        settings.increaseFont();
+        view.refreshAppearance();
+    }
+
+    public void decreaseFont() {
+        settings.decreaseFont();
+        view.refreshAppearance();
+    }
+
+    public void toggleNightMode() {
+        settings.toggleNightMode();
+        view.refreshAppearance();
+    }
+
+    public void toggleRtl() {
+        settings.toggleRtl();
+        if (fileKey != null) state.saveRtl(fileKey, settings.isRtl());
+        view.refreshAppearance();
+        view.showStatus(settings.isRtl() ? "RTL" : "LTR");
+    }
+
+    public void cycleEncoding() {
+        settings.cycleEncoding();
+        if (fileKey != null) state.saveEncodingIndex(fileKey, settings.getEncodingIndex());
+        if (opener == null) return;
+        final int keepSource = currentSource();
+        final Charset charset = settings.getCharset();
+        background.execute(() -> {
+            try {
+                LineProvider reloaded = TextLoader.load(opener, charset);
+                main.post(() -> {
+                    buildAndShow(reloaded, keepSource, false);
+                    view.showStatus(settings.getEncodingName());
+                });
+            } catch (Exception e) {
+                main.post(() -> view.showStatus("Reload failed"));
+            }
+        });
+    }
+
+    // ----------------------------------------------------------------- paging
+
+    public void pageDown() {
+        stopAutoScroll();
+        view.pageDown();
+    }
+
+    public void pageUp() {
+        stopAutoScroll();
+        view.pageUp();
+    }
+
+    // ------------------------------------------------------------ Org: folding
+
+    public void toggleFoldCurrent() {
+        if (!orgMode) return;
+        int section = outline.sectionOf(currentSource());
+        if (section < 0) {
+            view.showStatus("No section here");
+            return;
+        }
+        int headingLine = outline.headings().get(section).line;
+        folding.toggle(section);
+        applyOrgView();
+        view.scrollToLine(map.toDisplay(headingLine));
+        view.showStatus(folding.isClosed(section) ? "Section closed" : "Section open");
+    }
+
+    public void toggleFoldAll() {
+        if (!orgMode) return;
+        int keepSource = currentSource();
+        boolean closing = folding.anyOpen();
+        if (closing) folding.closeAll();
+        else folding.openAll();
+        applyOrgView();
+        view.scrollToLine(map.toDisplay(keepSource));
+        view.showStatus(closing ? "All closed" : "All open");
+    }
+
+    // --------------------------------------------------------- Org: navigation
+
+    public void nextHeading() {
+        if (!orgMode) return;
+        int line = outline.nextHeadingLine(currentSource());
+        if (line < 0) {
+            view.showStatus("Last section");
+            return;
+        }
+        goToSource(line);
+        announceHeading(line);
+    }
+
+    public void previousHeading() {
+        if (!orgMode) return;
+        int line = outline.previousHeadingLine(currentSource());
+        if (line < 0) {
+            view.showStatus("First section");
+            return;
+        }
+        goToSource(line);
+        announceHeading(line);
+    }
+
+    private void announceHeading(int line) {
+        int index = outline.headingIndexAtLine(line);
+        if (index >= 0) {
+            String title = outline.headings().get(index).title;
+            view.showStatus(title.isEmpty() ? "(untitled)" : title);
+        }
+    }
+
+    public void openContents() {
+        if (!orgMode) return;
+        view.showContents(outline.headings(), this::goToSource);
+    }
+
+    // ----------------------------------------------------------------- search
+
+    public void toggleSearch() {
+        view.setSearchVisible(!view.isSearchVisible());
+    }
+
+    public void performSearch(String query) {
+        if (rawLines == null) return;
+        currentQuery = query == null ? "" : query;
+        lastMatchSource = SearchService.findNext(rawLines, currentQuery, currentSource());
+        afterSearch();
+    }
+
+    public void searchNext() {
+        if (rawLines == null || currentQuery.isEmpty()) return;
+        lastMatchSource = SearchService.findNext(rawLines, currentQuery, lastMatchSource + 1);
+        afterSearch();
+    }
+
+    public void searchPrevious() {
+        if (rawLines == null || currentQuery.isEmpty()) return;
+        int from = lastMatchSource == SearchService.NOT_FOUND ? currentSource() : lastMatchSource;
+        lastMatchSource = SearchService.findPrevious(rawLines, currentQuery, from);
+        afterSearch();
+    }
+
+    private void afterSearch() {
+        if (lastMatchSource != SearchService.NOT_FOUND) {
+            goToSource(lastMatchSource);
+            view.showStatus("Match (" + SearchService.count(rawLines, currentQuery) + ")");
+        } else {
+            view.showStatus("Not found");
+        }
+    }
+
+    // -------------------------------------------------------------- bookmarks
+
+    public void gotoBookmark(int slot) {
+        if (!Bookmarks.isValidSlot(slot) || fileKey == null) return;
+        List<Integer> slotLines = bookmarks.get(fileKey, slot);
+        int target = Bookmarks.nextAfter(slotLines, currentSource());
+        if (target != Bookmarks.NONE) {
+            goToSource(target);
+            view.showStatus("Bookmark " + slot);
+        } else {
+            view.showStatus("Slot " + slot + " empty");
+        }
+    }
+
+    public void saveBookmark(int slot) {
+        if (!Bookmarks.isValidSlot(slot) || fileKey == null) return;
+        bookmarks.add(fileKey, slot, currentSource());
+        view.showStatus("Saved slot " + slot);
+    }
+
+    // -------------------------------------------------------- jump / hud / etc
+
+    public void promptJumpToPercentage() {
+        view.promptForPercentage(percent -> {
+            if (rawLines != null) goToSource(rawLines.lineForPercentage(percent));
+        });
+    }
+
+    public void toggleHud() {
+        if (view.isHudVisible()) {
+            view.setHudVisible(false, null);
+        } else {
+            view.setHudVisible(true, buildHudText());
+        }
+    }
+
+    private String buildHudText() {
+        String time = new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date());
+        int battery = view.getBatteryPercent();
+        int progress = rawLines == null ? 0 : rawLines.percentageForLine(currentSource());
+        String batteryText = battery >= 0 ? battery + "%" : "--";
+        return time + " | " + batteryText + " | " + progress + "%";
+    }
+
+    // ------------------------------------------------------------ auto-scroll
+
+    public void toggleAutoScroll() {
+        if (autoScrolling) {
+            stopAutoScroll();
+            view.showStatus("Auto-scroll off");
+        } else if (lines != null) {
+            autoScrolling = true;
+            main.postDelayed(autoScrollTick, AUTO_SCROLL_INTERVAL_MS);
+            view.showStatus("Auto-scroll on");
+        }
+    }
+
+    private void stopAutoScroll() {
+        if (autoScrolling) {
+            autoScrolling = false;
+            main.cancel(autoScrollTick);
+        }
+    }
+
+    // ---------------------------------------------------------------- editing
+
+    /**
+     * Long-press OK. Editing is a deliberate act &mdash; we confirm first so a
+     * stray key press on a pocket keypad can never drop the reader into the
+     * editor. {@link #enterEditMode()} runs only once the user says yes.
+     */
+    public void requestEditMode() {
+        if (editing || rawLines == null || saver == null) return;
+        view.confirmEnterEdit(this::enterEditMode);
+    }
+
+    private void enterEditMode() {
+        if (rawLines == null) return;
+        stopAutoScroll();
+        if (view.isSearchVisible()) view.setSearchVisible(false);
+        if (view.isHudVisible()) view.setHudVisible(false, null);
+        // Always edit the real file (never the folded Org view).
+        editReturnSource = currentSource();
+        String text = TextWriter.serialize(rawTextLines());
+        savedText = text;
+        editing = true;
+        view.showEditor(text, caretOffsetForSource(editReturnSource));
+    }
+
+    private List<String> rawTextLines() {
+        List<String> out = new ArrayList<>(rawLines.size());
+        for (int i = 0; i < rawLines.size(); i++) out.add(rawLines.getLine(i));
+        return out;
+    }
+
+    /** Character offset of the start of file line {@code source} in the joined text. */
+    private int caretOffsetForSource(int source) {
+        int offset = 0;
+        for (int i = 0; i < source && i < rawLines.size(); i++) {
+            offset += rawLines.getLine(i).length() + 1; // + the joining '\n'
+        }
+        return offset;
+    }
+
+    /** OK inside the editor: insert a newline at the caret. */
+    public void insertNewlineInEditor() {
+        if (editing) view.insertAtCursor("\n");
+    }
+
+    /** Menu inside the editor: overwrite the file in place and stay in the editor. */
+    public void saveEditsFromEditor() {
+        if (editing) saveEdits(view.getEditorText(), null);
+    }
+
+    private void saveEdits(String text, Runnable onSaved) {
+        if (!editing || saver == null) {
+            view.showStatus("Cannot save");
+            return;
+        }
+        final List<String> newLines = TextWriter.split(text);
+        final Charset charset = settings.getCharset();
+        view.showStatus("Savingâ€¦");
+        background.execute(() -> {
+            try {
+                saver.save(newLines, charset);
+                main.post(() -> {
+                    savedText = text;
+                    // Reflect the edits in the reader once we leave the editor.
+                    rawLines = new InMemoryLineProvider(newLines);
+                    view.showStatus("Saved");
+                    if (onSaved != null) onSaved.run();
+                });
+            } catch (Exception e) {
+                // Stay in the editor on failure so nothing typed is lost.
+                main.post(() -> view.showStatus("Save failed"));
+            }
+        });
+    }
+
+    /** Back inside the editor: leave, offering to save first if there are changes. */
+    public void exitEditRequested() {
+        if (!editing) return;
+        final String current = view.getEditorText();
+        if (current != null && !current.equals(savedText)) {
+            view.confirmSaveOrDiscard(new ReaderView.SaveChoiceCallback() {
+                @Override public void onSave() { saveEdits(current, ReaderController.this::leaveEditor); }
+                @Override public void onDiscard() { leaveEditor(); }
+                @Override public void onCancel() { /* stay in the editor */ }
+            });
+        } else {
+            leaveEditor();
+        }
+    }
+
+    private void leaveEditor() {
+        editing = false;
+        view.hideEditor();
+        // Rebuild the reader (re-parsing Org headings) from the possibly-edited text.
+        buildAndShow(rawLines, clampSource(editReturnSource), false);
+    }
+
+    // -------------------------------------------------------------- lifecycle
+
+    public void onBackPressed() {
+        if (view.isSearchVisible()) {
+            view.setSearchVisible(false);
+        } else {
+            view.confirmExit();
+        }
+    }
+
+    public void savePosition() {
+        stopAutoScroll();
+        if (fileKey != null && rawLines != null) {
+            state.savePosition(fileKey, currentSource());
+        }
+    }
+}
+package com.sonim.reader.ui;
+
+import com.sonim.reader.core.LineProvider;
+import com.sonim.reader.core.OrgHeading;
+import com.sonim.reader.core.ReaderSettings;
+
+import java.util.List;
+
+/**
+ * Everything the {@link ReaderController} needs from its host screen, expressed
+ * as an interface so the controller has no dependency on {@code Activity},
+ * views, or the Android lifecycle. The Activity is a thin implementation of
+ * this; the controller holds the logic.
+ */
+public interface ReaderView {
+
+    /** Bind a freshly loaded document. */
+    void showDocument(LineProvider lines, ReaderSettings settings);
+
+    /**
+     * Re-apply appearance (font, theme, direction) to the already-bound
+     * document <em>without</em> losing the current scroll position.
+     */
+    void refreshAppearance();
+
+    /** Current top visible line index. */
+    int getTopLine();
+
+    /** Scroll so {@code line} is the top visible line. */
+    void scrollToLine(int line);
+
+    /** Scroll down by roughly one screen. */
+    void pageDown();
+
+    /** Scroll up by roughly one screen. */
+    void pageUp();
+
+    /** Battery charge 0-100, or -1 if unknown. Used to build the HUD text. */
+    int getBatteryPercent();
+
+    /** Transient centre-screen status message (e.g. "Bookmark 3", "Not found"). */
+    void showStatus(String message);
+
+    /** Show/hide the search input row. */
+    void setSearchVisible(boolean visible);
+
+    boolean isSearchVisible();
+
+    /** Current text in the search box. */
+    String getSearchQuery();
+
+    /** Show/hide the time/battery/progress HUD; {@code text} is ignored when hiding. */
+    void setHudVisible(boolean visible, String text);
+
+    boolean isHudVisible();
+
+    /** Prompt for a 0-100 percentage; invokes {@code onValue} with the parsed number. */
+    void promptForPercentage(PercentageCallback onValue);
+
+    /** Ask the user to confirm leaving the reader. */
+    void confirmExit();
+
+    /**
+     * Show a pick-list of every Org title (indented by depth). When the user
+     * chooses one, {@code onPick} is called with that title's file line.
+     */
+    void showContents(List<OrgHeading> headings, ContentsCallback onPick);
+
+    // ------------------------------------------------------------------ editing
+
+    /**
+     * Enter the full-document editor, pre-filled with {@code text} and with the
+     * caret placed at {@code caretOffset}. Text entry, caret movement and
+     * scrolling are handled natively by the underlying editable field.
+     */
+    void showEditor(String text, int caretOffset);
+
+    /** Leave the editor and return focus to the reading list. */
+    void hideEditor();
+
+    /** The current contents of the editor. */
+    String getEditorText();
+
+    /** Insert {@code s} at the caret, replacing any selection (used for newlines). */
+    void insertAtCursor(String s);
+
+    /** Confirm the deliberate step of entering edit mode before opening the editor. */
+    void confirmEnterEdit(Runnable onConfirm);
+
+    /** On leaving the editor with unsaved changes, offer Save / Discard / Cancel. */
+    void confirmSaveOrDiscard(SaveChoiceCallback callback);
+
+    interface PercentageCallback {
+        void onPercentage(int percent);
+    }
+
+    interface ContentsCallback {
+        void onPick(int sourceLine);
+    }
+
+    interface SaveChoiceCallback {
+        void onSave();
+
+        void onDiscard();
+
+        void onCancel();
+    }
+}
+# Add project specific R8 rules here.
+# AGP will combine all keep rule files in src/main/keepRules to pass to R8
+#
+# For more details, see
+#   https://d.android.com/r/tools/r8/keep-rules
+
+# If your project uses WebView with JS, uncomment the following
+# and specify the fully qualified class name to the JavaScript interface
+# class:
+#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
+#   public *;
+#}
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A deliberately bright, thick caret so it stays obvious on the black editor
+     background of a small, non-touch screen. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <size android:width="2dp" />
+    <solid android:color="#00FF00" />
+</shape>
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#3DDC84"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M9,0L9,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,0L19,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,0L29,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,0L39,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,0L49,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,0L59,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,0L69,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,0L79,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M89,0L89,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M99,0L99,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,9L108,9"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,19L108,19"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,29L108,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,39L108,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,49L108,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,59L108,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,69L108,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,79L108,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,89L108,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,99L108,99"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,29L89,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,39L89,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,49L89,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,59L89,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,69L89,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,79L89,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,19L29,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,19L39,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,19L49,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,19L59,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,19L69,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,19L79,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+</vector>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:pathData="M31,63.928c0,0 6.4,-11 12.1,-13.1c7.2,-2.6 26,-1.4 26,-1.4l38.1,38.1L107,108.928l-32,-1L31,63.928z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="85.84757"
+                android:endY="92.4963"
+                android:startX="42.9492"
+                android:startY="49.59793"
+                android:type="linear">
+                <item
+                    android:color="#44000000"
+                    android:offset="0.0" />
+                <item
+                    android:color="#00000000"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="nonZero"
+        android:pathData="M65.3,45.828l3.8,-6.6c0.2,-0.4 0.1,-0.9 -0.3,-1.1c-0.4,-0.2 -0.9,-0.1 -1.1,0.3l-3.9,6.7c-6.3,-2.8 -13.4,-2.8 -19.7,0l-3.9,-6.7c-0.2,-0.4 -0.7,-0.5 -1.1,-0.3C38.8,38.328 38.7,38.828 38.9,39.228l3.8,6.6C36.2,49.428 31.7,56.028 31,63.928h46C76.3,56.028 71.8,49.428 65.3,45.828zM43.4,57.328c-0.8,0 -1.5,-0.5 -1.8,-1.2c-0.3,-0.7 -0.1,-1.5 0.4,-2.1c0.5,-0.5 1.4,-0.7 2.1,-0.4c0.7,0.3 1.2,1 1.2,1.8C45.3,56.528 44.5,57.328 43.4,57.328L43.4,57.328zM64.6,57.328c-0.8,0 -1.5,-0.5 -1.8,-1.2s-0.1,-1.5 0.4,-2.1c0.5,-0.5 1.4,-0.7 2.1,-0.4c0.7,0.3 1.2,1 1.2,1.8C66.5,56.528 65.6,57.328 64.6,57.328L64.6,57.328z"
+        android:strokeWidth="1"
+        android:strokeColor="#00000000" />
+</vector>
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root_layout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- The main reading area. List rendering is most efficient for long files. -->
+    <ListView
+        android:id="@+id/text_list"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:divider="@null"
+        android:dividerHeight="0dp"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
+        android:scrollbarStyle="outsideOverlay"
+        android:fastScrollEnabled="true"
+        android:choiceMode="singleChoice" />
+
+    <!-- Full-document editor. Covers the reading list while writing; entered
+         only by long-pressing OK (with a confirm). A native EditText so the T9
+         keypad, predictive text and D-pad caret movement all work for free. -->
+    <FrameLayout
+        android:id="@+id/edit_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:visibility="gone">
+
+        <EditText
+            android:id="@+id/edit_input"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@null"
+            android:gravity="top|start"
+            android:inputType="textMultiLine|textCapSentences"
+            android:padding="6dp"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:cursorVisible="true"
+            android:textCursorDrawable="@drawable/edit_cursor"
+            android:scrollbars="vertical"
+            android:focusable="true"
+            android:focusableInTouchMode="true" />
+    </FrameLayout>
+
+    <!-- Search Bar Overlay (Top) -->
+    <LinearLayout
+        android:id="@+id/search_container"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:background="#DD222222"
+        android:padding="4dp"
+        android:visibility="gone"
+        android:layout_alignParentTop="true">
+
+        <EditText
+            android:id="@+id/search_input"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="Search..."
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"
+            android:background="@null"
+            android:imeOptions="actionSearch"
+            android:inputType="text"
+            android:maxLines="1"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <!-- HUD Overlay (Top Right - Time/Battery/Pos) -->
+    <LinearLayout
+        android:id="@+id/hud_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_alignParentTop="true"
+        android:layout_alignParentRight="true"
+        android:background="#88000000"
+        android:orientation="vertical"
+        android:padding="2dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/hud_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#00FF00"
+            android:textSize="10sp"
+            android:text="12:00 | 100% | 0%" />
+    </LinearLayout>
+
+    <!-- Bookmark/Status Notification (Center Toast-style) -->
+    <TextView
+        android:id="@+id/status_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:background="#BB000000"
+        android:padding="10dp"
+        android:textColor="#FFFFFF"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
+</RelativeLayout>
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+RIFFt  WEBPVP8X
+      G  G  ALPHÌ   €cÛÖòä¾÷Ç=Á¥M…ÎÀÊ,Jjz¦6•»T!c@ Ó±×}/ë¿XÅŠˆ	Àß»$(¥
+Ru)Ğhm®oÄz}³Õ Ô¡è½5ÊÛ^h wöFi
+	I`ÁŞŒòÍ‘’	Ó]
+Kìñœ&û<góÿîíóœyxÎ=Û<%åD2D¢¡G{£´—ÑHBUf^Œòu¾’@xfxºyİißÄºİ¹nNgá”Ü`}l<öcõ¼x€d¥·?ö½•$º*„øKVP8 ‚  Ğ *H H >1ˆB¢!!jnd µÉ1Š¥¬\Éªl¨Ó?C[k¼Àt'Şô ò·ı”ø2ı¨ıÅøıjÿïœQıvÔNÿ¿¼Á‚–ÂÔÿL¿Lûş­ÿ¡üÊã ınŒ»KmPX;5sƒÅòëf~k°‰Cå€Ü™/;¼ªÔïJ¢æjŞ 	ï7aiCš´=wŒê·+·œ}•¶é€d„©Êá•kI¿W²Èw£ê¾œu-<zX?İ–?  ş´I¿Š›\t˜¦íx{äõl…—`o#„İ.Uõ°?¿Ëëò‚ÄÜ¾„8-é]kÜÇ bê¬8%ÿør¿ìW
+À°ÿûşø&|ƒ‰SVŸø£‘DÜ‘û¤ÉmRKvø€Öe¤¤BÁèëÀMª¾íªD“
+Şü¦\”Á¶åŠØËîŸlñ ?Ú§¸™?€Cb•z<ŸÍÁ8‰RÄ{mÔáËóPÅ
+r5_Š
+…ÑgşkÉ,ıÿáœ‘vq¸‡ôt/!]|5QCegK ËWßŸï³ÚÏì{¤Ãhsö¤‡{)œòs„ÓOØq/	Å°,‹h`-¢`A²B¯²õi$½N?‚Ôáºp&¯hàJŸÅõ%TÇiHXşïÁ°UÛz^ÊªTH‚ª½½¢¢Eõu‰}4jª{ï´µ}ù=<ê& .Ì4(IjV†rõí¯´-÷‹]ro šò•ëÈê°´GÀ$»şq‡á<%¬”“$¦P‡"`nÚlš?—4OCÎÙÎÒ.`²¡hEc85Ç‚1l3EŞ;L;|Å?~½\Š#a»œÆö/FX£Á6–”o	òxäÈ'ØqÁ½Õèÿûjõu¥Õt,oƒd^~ê³±‹|·éKâT
+ZJ.>P~KÂ,à ?İß¿RëíüZ¯^]Jgáäj°iôî¾GÃ¦!úó6F­ª<÷DÔÀaÚ!º+$_RÃt2/7ğôéˆU$3>q¬s,—ªe÷ŞÆ?åL~ê˜¬~›n¢òÏA¼‡ÕÔ`Kë¾Åö“‹÷eÆıÊSÕÄvZ·Eú¸«hQJ/_
+/óSùU˜DÖ?7	¹¿†g±ŒëWg5Úƒ¬ Oo Î4éWëï»†¹ü•Ñ´#.µ¥^
+umŸf&Aç„ì2yÿ%rĞÍ ]òa£«iïåó¯‡áí
+ĞÔ1VÅÆ£óxTİEg¯Ÿ²0èœ\é„Lù€Ÿoû†Êo#ZA„
+#ÃgÆmÕ=o€RiB#„ø÷_ıÍßK*ò¥sñ™£/ıG¤ŒŸÿ¿á¬Ÿ÷üï?àÓŸşSš†i†_"xÿÊë¾ÚØ
+nÄ³Z¾ÓÔâ±ÒÃØ¸qNÙ÷‰ÉuaÉ1ÍçÊü@ªöX"àå*9åòXæÚJty˜šIıPÄ»²÷TnÎ'óŠIºÙÑu,UöÏmZÿŸ=+y»à‰ãtÊ‘tù—0@  
+RIFFJ  WEBPVP8X
+      G  G  ALPH½   nÛ¶1IÚ_dfôˆduEF:#Ë¶Õ¶mÛ¶İı
+¶m[¯P¶íªïÜ»„¿Û€Z+¥‹*…€•±ekTÚjÖ
+êèT‡BmuÒŒĞvØİoüµdóöl^ò×wÖÀš$Yd¯ø|+ŞğÙY@Ù¤
+Ì|y+I'"Îyï½s"âIn}y& M",°à’";’?, lí´Fÿ$Å³Ê^H~Ğ­k·ì£ÏzñÜÕ$BÓ—dÌšÇäWMˆjaÌrÆ	t1—ET5‹cö3fBcî?¶JÎ$…‰òDU‰p4)L°Ç#ª‚Å˜ı&Z¸lEË)L¸pEte_2fâc~£*±¸™1Œy'lY}{éBpÜ;¦¼÷3È˜«r,æÑ3PÏc`Ki|O	Eø³Ò%¦‘>OÎƒ)fñ"…Á
+ß€-¢qèfºp·tAX\NÇ€o€-0êSJHÂ¯µ Ğº.$Ç
+9(Àà0zíy,`q%,áÃÊF¿Ş{Ú@)óGxÿ¤”R¨_D–ã’”Æà
+ámì‚ÖèÛŞÎáÃöÒ‡å¹w\Áğÿƒñùta9î­ÛŞÆ>(…Ì¢ğ–¶B)uÈŸ”°„ÿ5*ÓğVx6À¦ïé”Œ=ÁŸm- tïZº×Ó
+€mú‚’ğûf‹‚ôÍt!9Ş›
+T4r#]8›'Dª ©Ö7(á?hM¡¨IŸHúP<yfÚC]ûO”P„äêPÒfÎ"}¼(•B}ÇgŒÃˆùuG=Ê4™9;éBpÜyXÆ–ƒúöG)!Ÿio@Ù*“ÿqòbş4QåÁ¶Œ_Â8i1—Nn‰Pi:{ÂNJ²„»NÉ¦Qyc×å’$¡»¦»QUA5÷İä''¦»­¯E¡šº%åÆI‰¹óš|«Fuu[ÿÉKé\œãÒÓúÛ4ª­[{§~OÆ¾V>&œÖÛªQ}ÕÔ9æ©ídìkácrû³c;›j©Ò¹aÇ|IR\µœüêØa¹´Bm[ÏèË~s¤ç+ñNé~»btO›EíU:›wáûëIRD\I!Éõï_4.ŸM+$Ò4æò£{è»Õ¬xõ·6:Ÿk4H¬Éd»‡{åı³pí–;¶¬]øÏG/\9wÜğlÆ Ñº®%Û50bÌÄ©s>î¸£çN™8fÄ@W¶¥N#ù:•iÜëêéííéÊµnÍ¤4‚UÚFuõõu‘Õ
+5 VP8 f  0# *H H >-†B¡¡
+mk b[ ,G´ İğ¿‘^È¶/ì}ù§Gn­û™ù³şoüg±0ÓÔ~±~`?W?U}ãıú UşåÖ7è;úíéûEğ…û;ûŸğü«úOş›ÓOÈtú¤ùÎğûµ¿øSÂwrû?JÎx®ı+ĞWú¿üQï÷|É}û'ğ
+üŸú¯üOî}?i}?LÍ¾/ğVŒˆ®b0'›ÊğŠñúù(½ıšÚ`î´&Æª|}FBAQ/hVDÎÎşá‹T½¿P·-.{ñaÜÁX«·wÁÜxôïÊâô¶ãùÂ~sàŠ¾[Lï˜ÖgÁA¨(ÚĞP~›ä^?ÑùÑ´w¡Aõ˜ãî¼$êwó  şÿş®ÿÔE÷»øØÿWGšjY®Aâx…„¥Ç¨%}œG€£Ø5ÔòÕˆ03Pí’ØÂKe6¬FAL†îy4É`‰:±^p¿EïŠq
+x'ÇK÷¬¹@pÑ·²¼Ü!bO½7 Bş‘µŒÂÛjw4ªÇ>XŞvKåy°Lş6î¨4©Ïâ¢î·aK¸ß B#¹tky¦Ê{Š§á¥«÷bÅ›êÖnbŒçtÔÎ³:#²)ëü^W!h@»¯9£ÃBĞèà/
+îm]Å¾=µ+=ÉGø±.…OiRTÕOJì¿)7÷‘ğ‰‰>}g‡3I©Í%Í­wCp6 ‡!2{q· ÿ4öşìÀ‡ÍV-†^]Ÿÿ_lÃ_D\õCÌU#ú:}›–Nv›aÄ»ÆıÔƒ-?Öm?ÿı¾2y“ªGon_gMïU@Ä¸Ä4)Ùè>˜­¥~ÿKåD0°àlUWİ›ÏÔ`¹«
+ÿy¸óê+ü>àsAû…Ä—XCıãöèşyå¸a¹ù˜X„™Í§ÛL‡ƒ-.5ˆIJùUß0e¾Òà•å’ÜçÒù˜­ßŸm¸·Ä¼šãJa¢^Ğ¼r3)5`Ú0Œ­ mnKíDãœYdBtÆ0£
+áN¨qM3:o›¡œÔNƒ cû*çøæF6_%î¤ßÀ§ jFú¸‘mwëLÆ«³_x™¬¹ÚÂ±Õ©ÿÚ^@Í.ƒ3?3şu…Zå&‘lŒSuqÍÅÒÒjô„ÄM!— o§},ÍÜ÷(Ã}××…gìóŠzâO]uìs'îP"WfRz±‚0ª¨ıy§£&_!³Ôiç.ç¿/Ü©ÿ–NP^É/•şØú¯NÇš5¨ĞRY¹ç|¯Í£Ãö _Òo w>ª½a)}°«3ÊÀxà&wÚkÃ¦ÛCiMûö;µÿìÏà3b$òVQ—QüÄôU|IùÄ,³õÖo’Ğ³yk
+rP!§ğªyNCWæ£õHbê%RÅêh‰Ğiñì¬b™1ÇjàşyYûÆòÿÃÿÏ«±œUe?÷¨G/]ÀIk	E~{×û×0¼„æ¯AçúŞãW%p¦0ıZ@ÈEuá€cHâüÌuã¬yj5¤ôå?Ïşë¿ó¸6Šß¾•Š ^.ıÉ›ƒ"–y9q	äÔ^‘
+ÙgÇİ*E·^©{\‚MÊä#ÕÕÛ>wÅËd Å±ãE­@À’ÙH0ãæ–ÚF–;{0éê¢§áÓ¨=Å› Öd3³ñ¾ï¡?%Ò&¨l°ä›i·
+Ÿ¾øü8èUğjŞêĞ=U1wîÀ
+]]›•P…PÍÒ×x“îÀòÕù?ıiŠÃ¸‹Ëİ
+üµÔ#_@î|Mİ8ÚFí#Õ;è6úz0åİ')Í™`NT›O9lN¿³ûãP×
+„æh‡NÛ*¯•[¸/Éhœ¬g¶°ä†ûÒœÕ¾°©pÄİ´Ùöaœ¦{ó«äOâ)'d”¤1î(Õ÷e.†M|ã¥^¦)±n/N‘†ÈÓ9İI^*0•é}ÒıgıÀ#Õ’
+jØÚÂ]xsª{ó€¨/¿]f¤œDÔ¥¶=@’^VòN¥¤á›?>+„zÎeàMbfWÙ¸¿×Š&XW½¨˜¾Ö–x3 …ÒpO’¯ºe®†o‡©^Hü À×¢‹Oä >Y‚l9«š<beA…‡®ôßÑîÆ¯»rpc%Õ
+s(i;/X
+Åd¿+)|H;m8„+w%døØI·ûÿ3"Æâ²æ;fÍì£\6b©PãØgs`eûk
+{Š$§–Rìr€Şé™gTäG­<RÛBârƒÜ„-ÑS–¬¿õG~gœÁÕRhTêşÒ”Ş0wÊyo×¢ìù£RÏ|Òjƒ®¶R(/ÿsl]'
+9"«ûw?à{§qÉä²<ì”ëîºEi{x&)O¹M	.Õè˜
+Ûò<qqŸ–5¬M3û†üFc&AÛà9»›xø‰ÿhÃèRì/—„R8ü_ÀkuN¿wI=ã :  
+RIFFÎ  WEBPVP8X
+      /  /  ALPHª   €[ÛÖ²èò¾www«RÚó¦*\ÂQ\Ş·Ù1x—B²‹Çˆ  Ñ¸cQæ˜ ;Ss¾aŸ7M {í£’=Í-ÏòøùËşy\!®$²»ãï‘ı÷¸/AŞÊm)?°S¤òÑV‘ò½ÂN‘ê-ÈúøùËşyÜ¤nı£’c#á–(Ï¶‡ıuØ~TÅ1Yk°×“FÂ}Ò™mìfáa©e—x—VP8 ş  Ğ *0 0 >-†B¡¡5· b[ -H@kƒWñW›WÔ;¿’ÿË}’ö˜Û_âú“ï3ÏÖèåyìyû?éA~»jTùœú#ş_¸OêùÍNìÇæ9’ğGèYû}‡‚×x3õ¢Eª§ğVèÏv­8õ5¡.úæº…_µ§H şû©¯y!ÊhÆ|'äík¤”ºKßØ´^`$»ôJt+ûf²¡s¯8E²Ú ˜yĞ«ëE^SÜğfr<ûøOí~	ğŸ¾DÙ°oÿPÚ«şTˆÂubø2Éş>P×1òR•î{'
+{[JÒ_Ò«ê‰jy¼VÓ!Í¼Ş!,ÏùŸ
+´B“”p—ôä˜Ú§yòÁ&¥¸8«KÙÊ7É
+Ôn+¢Ïúí Ôœ»ä¹ÅnàãW¬_âvé¨bÌËöäŠÑ–1¾²å	‰ãC>¤ëÈ­ÇÏÿ"/»Ğ®yå~3ºh£ö¢‹Cšù£Õ¤MLéÙ—ÛzpÃÃÙ8½#Èœ<ŸĞœª˜¦1ËCÕÿM®šN"´ÊŠVãşó®üˆ‰ô±ğ˜»bíjøÉ›üá6KíxÃ§aL‰dĞ-˜ƒk¥’\_Z¯äÂ×PÄvªß<¯äëPZ“Üå¨³°²û¦tÓÑ˜‰‚B‹bne%ÇâõBÙÆ,°% ˜ïùpHh¯…G@ÖğPíıŞÈ”DzÿæœVşî&6(]}‘¥ 
+-îàPÍŞWÀ2ã]‚ı¿É_÷ò)Ú7ùŸKèO¹	Óy¯ÎJşÿ()(Å¹ÿ=7]Åñ°7PvZq¯ÿÿ=ôë-ÑêæûooÙ`Ÿ§\¼Ìn*ùFZ©´u!qæà‡@fb‘F}};š]òãºœ5›n›2YQú^S$_,CÑã$OÜ}ñãEØ@iŠ]s^7jìôãhW‡5-¹|ŸµÈV?.Ë¨®üŞ"ıIã†£šà=ÙÍÌ÷€*  
+RIFFä  WEBPVP8X
+      /  /  ALPH\   kÛ¶iÛêS{]Û6#™mÛVfólßØÆóu~Î.7~¶ß\cö§5¿ "& %+ã
+g2Öÿ­Ñ´mÛ¦5ğ_«³Ğ@§E'ç¿üşû/óÏO,êÀê²9 Æ¼?³èŸÌ«¸ò(µ²‚d"ÉŠ•
+V•Á ı^â…E‹òE?À”d€)%eSaº0%àéË<y0Eià*EXv^S0E(à8E˜¡O*¨B(ÂLE¸¶€Cß”ÂŒ…é@¸ÿÑÀzfîùJCÿÇb%d„kahT«`ÊSVÖ‚,æQ¥p	,ğ€>ÏÇÊ ãÏ”8„?w‡qXÂÀHWÃœ¦Ä"¼ ÔG1}jù˜Ş×šÓ—m€ößÅô} c\İV_ÆôU{ n>¦÷€äã˜^Tƒµçcºâ¬SkB!p‹r=~¤Ä!ü©?¬B§ôqx~P
+Ö®c1„À-Ö-+™Æ2ß€­²•!dwU±  Ñô
+}vïZÀü6™ø'Ó¬Rş9-qø[ç ƒd#GêXT¦ÙUŠd!ÂÍŒ*íÚŞ$Óò¥äívÎ X“´¿FúPàÉ‹âmÒæÈ>”|àGÛ$¥ê\³YoÈà%ÄòÍœf9ƒÒU®n×½•$)E’då¾nus
+euI“[?øEÿğÁÖM‡r+Wµqç1;n¼ÈşÍ7Ÿç_ÜØ1¦KãªN#Cm]­Æmºö6|ø°^]Û4®å¬FÆÊær®jõš5«Wu9gJVP8 b   *0 0 >-†B¡¡5¶ b[ 'L¬şƒëßŠ¿°)œiŞMİ¢¿
+±>`?V¿Ñÿn÷ªô=èıWû7ZO –WìGÁŸíç°ìWÿûÊ½ô<úí"$ø]Ú_úŞùá/¶Ô~ÿ¾Õó¹şƒÓÇüï2_D¿÷ş[ü÷üÏæ_Ä®ŸB/ÖdbY+‡,®¯~¦91m:Él”h_ñß‘¥Ò43ëóñÈâéåeÕ,ù&c•›îI²EÖ  şş{1íUB}XåÙw‡asÎ&–ı4Wjí¼3Ps}«=ÉHêï²Ãñé`ÔŸ1ÆWê £šå²µçÃõ'âü§,ƒ½ÿúU¸øw)7²ÙÿŸÎ£ãĞë§ÿEW›ë•[®B@FTª€™å)“0Š¾ËıÆK¡vÓ!%é¹»r¹«Tó©Qc.~©é„73q¾ïáè
+nÉXz\õı`6_ ›kT<c^×¡e•a3ø¥¾¬ã şœÿâ¯ş ·¿‚ÉÚ¾9#AhvëQÁ=“'5Ñ×_SçŠ¬T†³´)ü"›‘èôà<£ïxõóP4îÔã^æj¨*G©ş¢¹Ûíì¦õ‹Fƒ©©À|ø¼íQ¸îŸ‰0ç‡–ğs¼š›}f×4Â¹g£v¥£äÍ·{ê{D&ix·—'JµòÒò+Ò²„oå!|Bƒª½6)
+û@”æWœüÀp‘O¸x¤ëÂõ— S¶ûadh5¬åÂ5q0ªˆ‚^¶S¦¨=±ïg9¢°c4ÃJ­3ææÊˆµcğ~J;İ‚\ØVÊŞJ¶è–øGÿÃOØoâ'~•B Z^v¬ò©“³î¦O¯9¶çx<k_]½Ñm„•\ñFã4„ì,›ğ­2ıí—ä‚a|ıä£5ßcÙdx’É&µÜ²¤5şèúAšDÚwm”“*¯¾8Ìgˆ)ÂF„õÃ—óÜ”•á ’åùÊ#'B!µ&%€Á7Cäøp3S#«ÜÃÉl¾ `òñuó²…÷dOP<–¥U$–÷[Î|µõè:çsÚUÌ†ª» [×Î÷}·%«
+kõÌå£¶?†‡fıŞ{R©.lri•Ñ£œ*lø–¹ '>)¯‚L[±)„“C¿L"{Ì;cí‘O–§ë™Ø«±hç (ù›zóö óö®âJEú³ù®çÍ÷©ÿıÎ¢DxGüİû@¥™ì/?s<^%‡«(¿›ÿßTK_-ëÈì]#±"Ëã	–V9Ì€‹}š.•ög”ÿ5{<ÒK]+¾M´q\J"™•C?HˆŸ{5Mú±ŸtÒÁNÁ0õø^šğW}¾—ŠNWr|·™vÏœÌz 0+`‰³²QÓ•P_Í-¥[YÑ†n‚~×…hØş.8‘>ÚBj³u(éésAD7H  
+RIFFd  WEBPVP8X
+      _  _  ALPH0  €c[›"å¯ú«qwww÷Ã\V3‡œ˜Vãn‘»Ñ2XÅé?B#bà‹µDåg ‹ˆÆ€URUéóª@BÈ¬İ½¾¼úúåõn-hDAÓ!1yØÊ BÖ}8.ƒÎçšX ;F,ÆlZ4 !~ƒ\bÒ¥:•äqáÑc –hyç$Ø+ôd++ï}RÛY	à¿ÿ~ûx7ÒÁJpĞDÓ#'OİzswÉåÂ¥£b=°Ò—Èñ³i9İ½”3²AÇ¦‹Ô8=‘R<}AL^Î§
+=P95£+§/¡`È×ÁĞëéêXM®ƒ"¾¨¦mx|fÚç3ã#m5EñÂÈ„üÊÚÆ&ß7ÖVæ'H0+¬äì‚Â"Ÿd'[ŒT–ï
+øZ
+VP8   ğ *` ` >1‡B¢!
+Uƒ ‚ZŞÖOTÓ-Œ†ãğ5¶ûôâwÓGÌê/ª¯Hê¯Yÿó¯S-¯eïÙŸØïhïşyÌÜó]ğ¾û\WyÎ;ˆ½%ñK^Y±õ”ô ın™Õ¬=¶brM¦ûÓµkIöÂª­jÚí`x ÿ°p‘JBÁBáÿv³M!ì,1ğ0ÂÔ)
+$ÊÕvRÏp‰C2‡Xáo2Ğèæô¾írqô¨'d@½Ø_jŸŠºfSv…”¬	öiBœçş¥º t^o)ìJA|
+¹*¦cé^\‰¢ÿœ^Âıéz;ä"ş  şü3_¾hâ~L¥ÛÉEÀç\´_=Îbf]šÑª¤jê‹ÂÛÇæT5 /½M‚ÜÎşƒÏ»éLÕeÔŸàş$÷…»'š–¹FìSÍÀ2ŠÀ­İƒ³M½æßÑ“@gÑEã¸OšLïã”»İ»_³¤ó•ÔZîYF‘Ö4ò„y]5ï”éè§V
+{~QîŠ×Ïm¡(¨ÉĞzÁX¿±XVÚw»Ü©Y‹$ı«â^µ¡ÔfzLCRå®Á2åƒˆ<.¥ü¿¤V#È}h %¼Ì•Ó˜}¯†¹¬Ã‡ü?âmÿæ0ÊE‘çøµ]‚AUrFH.¸××n7_v@– 4<©Î±c9XÜœ^×}o@+KFße„fãöşä€{ƒ£bé³%¼î†.¬šı‰¶6G)Ÿ°¸K
+ŸÀã?ØGê¨Ê6Ø½í2Ø,§ü€ïbê °õüçÿ–oü˜#÷iÚÁİû1¨å$Ñ<ÆŞT$]ÌÊJI«ßºoF Î§Mg7¯H´a«ù|zĞ.r{¥IEzíáG¬´Ï¤êuKÿ«_ÁÉ »%á¶-%›1Pì6K1–’ï{{„NÙÿŒØ+úL‚æ¾ğÓƒ¢hİ‚~¥Ë0œ³`30s¾{2ö0æ¸@¨²ãÑûî¿d‡Ÿ‡kÅÄüä²½¦ÃÙæ)ÆjçÒy«ªU@ÁÇ+¯YCshn#G*ëõwR®–Ç#Øu2¹µ¦¦wY»m%Äõ|‡Û	ót÷‹ƒ-¦‡´ßR¾¡V$MP Ò¬ÆtaIÇ‡µ‰œOÓ;`9JtÃk6õö‹ìÈ|î6wEÈÔ™NïÓÎÁ¡+wP2˜eç1ñêj+ˆ•Í£Qb¦M]ÿü
+t®|	º<õÌl°k%3h½ ÃÁ®‰Ÿ2×[]H3ÿëß8Ôä~S²«¿"¦ûü…ª–[oî–zÇ°[¦¬ó
+Š4v”Nİ.2¯£ÒÍºm àƒ£­#-Å(9hûcóÖä=ú·÷³4¤´>Ò>ëúroñ„DkãÛ<E¨½Î/»¸-gEyC5±Å±ê.†ÎW2àLrªù&¦+"Z•$—@¶¶2+ó&ÓÁ°KTq¾HFÊ´ìjö÷OÄ¥c‡‡ŸÿßşÁû„èT dC'—oªÔ’õäq¯¸vXFÏÛd¸EšK
+H2,0¥K/–.Eh7	‚ê«!î.Ûtv¥+·Çôœ
+6vuÂÑHx¦û¯m¢”ˆ<ô-¸"=åµ¢ÙN×J‚fìMí—¨B©$iK·lØî¸=ÑÈ÷ğÿØ¸m«G¤wÑÔK„NÎô¶Î±=Šóçp´NBq¢_ØY³­çOxÜõ++ş3»şD~
+=ø“Ä•lú}(C¿ÈÏÚ?û ­´YÜ…Uóè¿şƒ˜é%ãP	õ×Šıö¶Ğ¡ Ù‚‡Î=“Lœ-¿µ·~õ¡M>h’õ…â… ]¸±lLú9®‹SÊ/ÜuÏ/û¬ğ§g¿<_wå_'ræÈ¡´¢/½Œ€Œ{ï6xÏ
+:Ó0rbüs´ù‰a…Tİ­®Şƒ²d:M…¶4}Hç$Ëÿ1¯P-«Í¤ˆ4¥ødA¤D›)í‰c¸'L“›´\=|¯ÎåúBêk_¿y4µšAgìÃ$Ÿö»2í‡öÕ·ìò{”H«Ä  
+RIFFF  WEBPVP8X
+      _  _  ALPH  ğ…ÿ¿éfÛ¶ıÿI´MŠdWŠÔ>lÇiÛ¶mÛ¶mÛç¹tØ¶±û°:Æü2Ì9¶s9"&€şd¥ô¦Jql”1š:ÔÆ¨X°¶šcãsKKsãcJÔVsö´a"Ê-<á]ßû÷E7í¿ç¾ûîÙãEÿşŞ»°#"6:[FÑÖ§~í¼»ÑÅ»ÏıÚS·‘6ÙÑš¨üÄŸìD«wÎy/"â½sÎ£uçOX&Ò:ZM½ï
+ ğ^:â= \ñ¾)"­ÓÇ†¨ùÅÛ°!]²€Û¿Ø$2œ2CTùĞ€w=Îw|¨BdÒÄ–èi× Î#•Ş×<Èrj”¦ÚÏ€
+AjeøY´J‰&zÄM€Cªpã#ˆt*Ñ»€”‡
+à=L&†ô ‡:à‡†LÏ,•ÿdRÿ$Û#CC§Ãd48œQ%ÓCåÓàa‡Ó‡Èô@“ş2íğKºkŠèûp![ÁáGLª[šŞ	Èx¼t—,=d^€ÇíŠ¡Úpˆ ÇMÛÉt™
+‡(:üJ1wfè©@ˆC C¦#MƒWÁ#’×Œîˆ? hz|‚;Ñ4µÁídÚ3ü9xDÔãkÜ¡‰½˜öÍ“mGó»!ˆªà#¬ÛPTº>.—WImføq@ˆK Áffõ#8DÖá—š9IQıfHl·NN²ü$ Ä& Ïå\’V_† º‚ï( È§ó
+¤[Ïİ§;ÖÙ&=qÂ³Ù´hõvHˆO|Hi"b6ß†G„=~l™‰åş«ÿH).«‹«¬‰4×®Õ
+¤æNHŒ»—ÔÂí±ºã@•°zW¬î>,A¯Åëp°t{¬î88ivg¬v¯%m¿>F7LkC¤TõüX]\WšˆÕÀ?cõ¿ªRDlJßÕÏÊ†‰ÈŞƒâ>Q°ÔÒ÷t@â#À‹ûr-&wĞ¾8İ~LÎ¶°=+Nl³ª…ò•¯ÇéÇ•<%•„ØàU¥¾$İ¿x#$6‚[ì7I”û)\l~WËÓ¦¹¡ç !.xÅPºĞ¼>.W,ÌfTû($Ä$¾0V 6s‡î„ÄD°ûØ|;\ÚúµØ|k‰Û¡|åÈ]xöœPé£¶¹¼ıÓqùÊö2·G¹êòåp±ğ¸êÀj:äò¶W Ş¸m€;!Smş>lV
+uÌ…ú!×ÂÅÀáú#ê%îŒT¥ñ<ÉÀ½´QÑÔM;6ı	@²&Àç¦Ç,u•ûëó?ƒ„lÁ¯çëî©m+ÿ€Y
+ÿYİ6 ¨ÛºÒX?>d'xœqP£¢©ëlF':
+"YÁ™‡NŒî±›<àŸ€dC€ÿ<9f™zÉ¹ÚÔÚ/ —üz}ª–cê-çF'W>µ/iÏ­Læ˜zÍvxréE×.]¸î¥K“Ã–©÷l'ş >=^€?»01d™ÒÈº¸cfõ
+—"!
+A¸âM«3;Šš)¥ª¯Ö\<üK;à¥Wâ°ó+‡/6k}ŠÒË¶Ü˜Yyèwoà|è^ğÀmß{øÊL£l™ÒÌºotrnõ!Ÿ¿ DDB'AD .ùÂÃVç&Gû4SÊÙkSs+‡¾ö·7 Q|«ˆo$^ÿÛ×¶27U+¦*[¬MÌ,­ğ†³GĞ±ì>çGo8amif¢V´Š2ªlaxûÔÜòÚ!~í§şßó®¾e×Ş½»n¹ú¼ÿşìÓ¯yô!kËsSÛ‡VQ†YçK£æôüòêúA‡{Ê£ûØGŸrÌa­¯.ÏO7£¥¼fÊ8+“/Vê;&¦š3sóóós3Í©‰õJ1oSY™\q°:R«×ëõÚHu°ØŸ3Š)ªÌJimŒ1Z+ÅL© VP8 ‚	  °- *` ` >1ˆB¢!!y¶X ¶ ^§½ÄŞ¿ =®*ïÖÿ~è˜ê€2]ªş«îƒáG«?0Ó¿ï½QüÂşÆ~Òû¾úJô ıfë"ıÀö ı†ô¹ı˜ø6ı«ı³øı‰ÿÑÖÂ«ıW¶Ÿô?½…şUöË)ïè?,¾Bvµ7øÍõ<ãÁ[ë_î¼%õï¯”‡( >Á?‰ÿtÿ_ıògäc>¯Nà÷	şKı;ı—÷ŸİÏñ]ş¿pı‹ÿZÜO«¦H’ÉW›ÃQ£Ğ®ìAJ¹ƒ´øOâ”±ä²,ªÅ…n(×®‚ú&«R´ñË–æl
+‹KÿåZÊ]å=‡3¯šSa£†¯iÙsín‡ç.zo¬L±AûF|q`™èB¯¯ç/şÂAÊ‹ôâ—%¢Ø‹çMOªóùéõxÈ5ÃçMT@9İìª%/Ï‰-Ìœ93Í‚pˆóŒU,\š‚^°Wò0ZÒr§İ¢á=!:"DĞ  şÿÜ‡ÿò_í©gÃâ“ë×÷É3FªV:r‚Ç$¥ñ/ùœù^Ñæ6Ä4¹9yDˆqá/³ñ"^Œ®e<”ı
+fl•ó~”4ø[WÔ}}ö«Œ­Æş•‰œŠ.µî~[ubHäs~İõiã³æ2Ä„Õn•ÍË¹çy°Èßì^‰<ÈªÂ†}v)².£xŸ}5¯´˜pò`”í¹2¬.ÜÌqFÛ%cÙßbp”,	RÎ);kÇŠ‰qWÊì )˜²çàÔ«©.}‹Ä•g1nr ªßoVıâàV7Î†p«_uúDe 4£Pe ö™p˜¦7HjF~< ©œ.L+òCøüNşàÆvÀ#£\„ÇR³šå“úÏ¥ïÄ¶' ×ç˜¾J$ç«:ÌöàâM¦ä+ áêÃ jÙz\Œ “$L…Bv–Ú.eÚ*òfĞ¬Oûl=õEqmş++ôºÉÁÿEp#ÂtÆÊ¬`*ÑˆÔ6‚)8óÒ:ÙÀ<=·áTu¨qÑş_#&À~êb£}ÿs8Y¢†WC¼Æ…à4Y\¿ÛĞdŒA=òWL2#Uæ„Eï`?Oi&î9ÃØ™ü2ƒ•D¨›¢ø¸x¢Ş<Ü˜ı`J Æ¼3ğ0Ÿ\õ†ÿ‰¢4QÁ¡{=^ø†"K—r¬·}‘RëÀÕƒ—ÃPu{İÍÑj¾j›»ÑA¸K¸ˆu^ğĞè6ß®ò–ó†ÒZü
+¨çj dÊbøÖœ‹|¯ámş»êåX>˜p" ¡ôÉ![?éjùŸ‘È>#ÊHtüfÜeb'5ıï‚¾Dğc‡6-!qªwù|× Ì™ƒz×3‚ß7ëËÔäéûB®hwÀ(ŸÈ¿áK‰Ü¯®—ö¤ÚøW˜í$¿ğ\©ÿ×üw)w©¬-ÿ/^ÅboŠÚº%÷Ñ|s	{]Ä×ÌÅ0kÅ¿àÿa=¥ÜôU&ÛÍÍz‰4„pv,M¸Å±¥åMå£„Õ(qIô‚Ï|?à´ğ9ŒÇÿu«Ñ£Õmîbğ, f“ÏãcÚ fİòË(¯êç°êÅZ?šÇR(äH 
+şœÂİê”¹›ÑFä¾EX³ıKîÊˆì¼Ïç9;ç½š,»ä­¨`1Ûäº‚}×V§Í79¦ï%mÛ/‰Ş`ã|WìV˜ÉñS“i†½CİŒp¬ë|Mš7¥ŒÎ>øÑß6Yõüsß;JaÊÊæ\ësğŸBMË¬õ–kÃyıüéŠl÷ñÊ\¾¬-á	oécc¼“aOÃz E=Ú*T›Ã
+ BE>¥|ÏsŸJl7‰ ã„-ö)gÊ“~MÛ Øc,š—«–Ì&,İ°œü’?ƒ‰_
+è\k:T^N‡
+–¦ù~A¿é¸œÿßóÜYBq»¥OF£g]¦elEmüÛJŠ¢å’í=?¿UÁc*s›ÿÿŠƒÉOSÒ¯9‰~HÂ£w~òWk€—dWŠğG^S –ª_Q/>Û
+(ö·W–.—L¾äUxAß»]e„7i]˜#ÙWòö?ñ˜éè	'OÉ'4ƒ¦i[îí«ÿ¿úVÉIÍU—¶­NÑ¬öQË±Èä{X­½[±üÉÄ„Ì·ó»n XMpâ}Óç„¬Y³^aÍ÷âjı˜`Ò4¡AnÜuäÁDšakºkYBT%ßÆ›5]6/¯Ëİ#®C]¤·!mÓzÎµ|Ë^9Üõ\ÆñûSÇ—<—F¾o&[¾Éxn’ƒØÈe½ê0°Ã”ÇB‰M~æüdp¹˜&“'"}ã†¤?ü(üé:ÂyEi2ÿúŒ9ØÅ—0wwÒ/7ÿCzsxâ`’Òè$Æú‹ãLH¿­ÈÃ üüı«½' ^²Ù´«Ñõ>Z¼ï³ô–®bBı‰Â™0.Ñ
+s²WîxÉM÷¹)ù…6·®ßX5¶TÑ‰öØçĞb%ßcÆoïCT¢ëíöÛÕ_:ÁVƒïğrì!4o#åKWñ	(á·¥ûÊ»Y•MœGeíÛŞpy¸İkÔ&xß‡m¿+¨‚XˆgcÔõÖÍ9ølœşœæ_G÷&Eó{/7˜CÁSûKãÁ·Íù„]ùğ£`”áìoîoEÂ¶ânËA¶X.Ï%	7qYï§äÜÍgĞĞ¹_y
+ıõB<š­—«jY×
+Äö8Zês"#¬/Áiü@ı÷™áhê%¿V
+r#òÜ_ôf>İhÜ$'ØïúxşæUŒa0YšŒ2ôî«EF`s”„Àb£ÁW~¥ï“G%ÿÒØ´À%¬³¡ `’'2À•§Q;k7·q›OØÿñŒßBê:\óıF"cÊVN9S‹yı•ËíúÑíA;ÖÊV(íĞ.*0È14¾Ş}±}ï".İI¤"<Œú< 
+Ç­éUOá ¥¤Æë;ª£Z´¾°ÿSBÄª‘¨zI²¾y-_@Ô
+šÁÔßèçÃ‹³å<D¹WØ©üõq¹4R³y@µdî;ş«U„{ó:4RàVjÒa-”©M+ÃğÂsï;Ú°ˆÿÕú3[AÏl;òe€y·ÂÆÂhtH!Öq›%RY‰»§8  ¸»øZ‡äsÒH¸òíÈ»ñén„ë;ƒœãh¾şuí7"°ìGò¹ôª2b?™Ó‚NáÀi–-š&È¼şr   
+RIFF<  WEBPVP8X
+          ALPHÖ  #Ù¶j7ç\ĞCá1333AfŒ1€ÙsQ9Tn™Ù¹ğİ÷şIÿıõ®"bà/µÈxì3Ì!ŒÈæˆ  »º¾.æë«m 9ÁA]{¹ìÆ|°ñrí¨ f“1Ï×Æá ‘RQÆ€‘RD‡k0G1¢Zä
+È =w u<NŠŒªè$JŒß1Ïºàó_Sd–ˆŞ§³Çxó&eÌ’¡­^Î³'D§2Rƒì4.5H«ÏD“V~M}SÙf²ÿûï¿ÿşûïW‹e iÂîİ4ÏÖ„-³ÇíŠw™%¢OM¶Èsëš%¤»I‡iğ—Ìs5ák@«¸ù
+)“(úØ^l£™¬>A¤Ì¡ˆÎT'¥áWµ\&
+Ã(cÀ(‰n¶TûB0;ÑØyæ#óÓÅÎÆ„Í@#J¿¬­{üÖ£¯Û¡Šùpûë£Ûİme¾DÀ¬¢Êö®¾…Õı±¿ga°¯«½²Èb ¹]TÑÔÕÓÓgÀ®¦Š"›£@n¤ªê[Û»b¿½¥¾*U`sİÈóÜ‚Dº¬¼¼"ÖËËËÒ‰B7#èGäÒr\Ïócİó\Ç’r‘1n@Æ!‡Ñ€ğ§RVP8 @	  / *  >1‡B¢!t¢r‚X›R²•ìËQ~ùûsàÅ³{hß_Òğ‡V¾W¼Ëş³ògû—Í/ø?ªñ<ÁÁRé‹æùõØÿvÿ÷±} ?P:ê£Àö ş=şïÓCöáÛö¯ö“à/ö:éOãe‘0xw5»"[‡š‡˜¬}zÄúş’¦).%ºT¤e1mÓ@Ök0oÕzı‰V
+‹k¨@ûµw‹£ê…ñÒİÒÁÒ­Ïtƒ,í9úQkË­xçşû ¦}ºĞşóèŠÙ×& ñ@Yˆ¿ŞÔ@÷9L#µıïéÛRı6Íi´ñlPE$!ùz±Æü¼Dæ<!¯ÎK‘ò÷yTØÇF°WäSğ¬< Cw¨é^K:×ã‹€tõêJYp>œE—ç¼t+q›VßÎnBôØ3Í;kë¿É˜4¸ì\ŒËy¢Z©®½,ñ
+×ìÎ‡ÿôâ.ÏnàÂÅÚ’ı€­Y^~\¶n?˜ƒXğ  şÿ`ëÿşš¼ÔKæ_ƒ_ŒLFü·ÖÙ_¡Ş«	YÃóÙÿcÕæMUéúƒUI¿P¯è°Ì1ú]’<kÜôBE
+Ãc…²ÖJÅ.Z¡—-<âåÃ¤’¸µº5®*¢$êW3¥ßšëMÈ¥fç¸FŞc[Q‡‘ÿßş€};‚€Çÿª•9ûş•Š&ÅoµN¿ßù¢ıì )~?Kï§×şõK¿˜@nÉpäqÔâ”<ßú¥xûşÊÈdf¿:Ÿ¤Ñ°¥jNóÑGÒç_œ~3c%ã_’ ì¦{ÈG`¸ˆ6…IT¶qÿÿh¬~ÍˆC -_LC§ÂkÁ˜ç2˜ÈHE¶ıÚÒ³q81ˆ ºmàF»Õ/¾`â#UĞ {¤5Üdˆğë{yL oyš:˜ç­ÁMcŸº÷6îe³|'©«ø×]¡ub‡j¢V<ñ:Z°-
+İõpQ4%KçÊƒ?Q/ı(q!óàw“'ï
+³‚EÙ¾Æı·{hšÚpeùzwHÿã¶¢P«ş	GlÏ,¡C¥å™ÀÜíÉ¾Œ«Ogô ?jé‡äCóŞ¥j±òíñŒæ7¨{K×e['ÿ\›ÈF¾V ğáÆCş'—¥×(lGë·–§ [SÊxŞËxB(åêwûê ~çóÈ÷9¥6!6óß×>½Ö²2Ü|¨¤-Ó?"¶ÖFå«İi<~AmI'BWòÄmeZæZ„Ä5wDU> "²u äS,ÛX½m>WtÑØÇ‘ËY}|“d°˜YóQO1@§‹d­m±û¦sa	£#°c^%ëæ{ıV&‚)Áù³hWSwöÉ¡s*Õ8öR_>ÑQ^ßJ‚	Òh›è\Æ§×µSô£ßƒ8a—¥ÌDâøšâw©°¨á¾TÉï‡À°ŠÂTVd¿ ³»ËƒG7©½ù•@¤x¶D|Eé6€ãØF¸[…‚»Î¡«²ú~ğt_ı§A¿“¿ñtØôÙ¤ŸTu#AâMÍ­VQ‚è.Í„×¯µK)şÿe2‰ÂX²ïˆÅAÕ¥İcB÷ÜG÷’g$HËatSuD~¶ìô^Òl_“˜Zpn»ÆÆ¬,ºä(Ó,ï~Ğ[sÏ]06ö€ÜÑÄˆ´Ø¸êI„NÅFVæ…F¢tä®İuÍü89ÅŞ«NŸÔcømh"mÈ¦ñ$Úº9ã²6¸Fûİ2½ˆk¸Vó‡î®iIbÔk¯ÀÉ:éª¦åh­Ì ï~ä>êÒâ@œTCüH¦ı€J¨­µşmÿ°{E|Êp“>ü™eÑÕ;ï6¬¹ˆšvy2Ö3·Ã>Aê¬ÓæÄØ#zBQØBÇ¼;°9Vİ}xz®ó°sT}7ÿ:ö<é-ûçqUç
+/^¦Æ³ÍÊ»¨äó)ïŠówŞıYQ8ÄRÔ‰ioã
+àñâ±
+<æ©¯§û®ÈAXth_
+Ù*®r?@K‰\1»C[ ¾Ô›u*‹°\_O2Ö•.Ëe ×òàC*W#Æ¥Awû¶aMHr`,¡|{ÿş:#	i¨RB™ºƒšüÿs™å8>Z×6©#R~Õ³&Òã(ş›7÷mêª+òf#•†¥ï¢—*Åõ‹ „wbïÌECr$«'x>ªûİ¨º?ÄLÙ¬ÃKA5Cl§æ(Šr·dÛÀd8*Ù³Ïs–HğŒQ‰ _
+W]¤ys…$nrrı"°±{îšJ¿(¾]Z4¨Õ<ğüáÇÚ—GËÎ}÷‡‰qª¹#±Ä»¸
+ß­1r#íÛAY<ƒcdÂıòºş>·SıĞ‡‘ÖĞı`px"²üõ6X¹I»~ı|/¾şn…6Ofzı3Š.;S×*T,{ÍÒbÓ{×ËÔÓZ0C®í!„&±NãıW®y¨xÆ·ò¨T$÷¢ŞÂˆ šÈrãmóIÛŠò…•ÕÛn-?ÿ˜èÑ>¸ˆgººı÷FÈğE:#,ª”pydÒ#u¼.ZÂ+d+*•~Ã‹Ñ¹Ô0s@5Üo3úwÎšYU0Ø¢’Ï‹âP1C-DÅ†ş+ë]é¡®ßBŞ,® óW\‡ğ“—„cßó¶E¿¿üî–Dz$KëÚQuÿ¡‡òi>· çşRW…´’¬¦!mìUN_„¼7œ
+F±”ÿQ!nÔşïçj’SÏ"»›Ö†zç‹òöÎ]1«)ñ¸˜Ï6%™·\êb“…¡&§øë| 	k¤wAœmŒìä€ş{r8ŸMy@¿O÷Òg«
+˜+§{Z
+¿k"ĞXÔqen¿wB|fÏWZ_…”BÚ8òM ô.‰D§ˆ¾¾Uó05õfTš U~¿;®Ê…N¥<¹+/—GYÍ°¼¾Èƒš
+º^¹›‰¿•t„şŠÿz,—°í/ğÇ¬Õ¯ÉzËø˜>l†î2ˆ78›<Ç¯²´PuF6e|ç©ƒ´r¥îW:ôhWÈ	µc	şmÅTÊësBl¤LUÊ
+Àf›y/ó!A†‚q=›å7Á‚fBèèiœà¤=;ZwIeâëÇú€KWú—î¾6ıXu¼À´óU¾Í;Ùp    
+RIFF  WEBPVP8X
+          ALPH#  …mÛ¶1Hvw#úöC°%§“„#HÚ_|„ˆHmGµm-ÙÁ]¦ €õ/@0—ßõ@g0–¶m;&Iºïçı"QÈlÛ¶mÛ¶mÛóæ˜•µóÌÎ6Û]¶íêÊŒøŞ÷¹™ñ½¹ˆ	 Nwl"H9#IÈ…Öi„$e‡4%ŒÊ)“úú{R}hxÛVaÔ@—òAC€÷?ä }÷Şi»şÂîqhóÆµKÍ½`
+ ¸r@CìSN?î€]ĞîÕó>ù÷g;àUg©g\zÎ‘} à‚`AÌ `xÚ_óÏ-@°
+£!¡8ç†ËD’h¯$1 ˜÷ëŸı
+‘\Ø÷ÎÛ”hÄxË|ñÊ¾HnU\8óÑ&Ñê^à¨7¾r&ä¡j.zåb 2 ³SÄä»ß½B¨†ˆÓßºˆèø"pñsg ‘•QDì÷ÁİP*Ğ,¢pÅcû!†j`ˆ|ùÍ¤€..¸ö¬€pÆ×NDDw[ÄÀ­§#Z×™J|ğ6¢ºqÂe€u—áûÿÄ•h ÎİÎ.2ü õÍÁˆªÇ‚Ä®1 •b
+%0xÁ.1ÀU‚ÈP­é»Â€X?¢j-a÷©`R9ˆLa»A¨óÉ`Á&£Ó
+½‡`G	nŞ°ğ­P	f#,ş¦ÍPÇnfXÁ-[¡|°Š+êPGˆ=Ö€˜£ N0I6YøPÖax¿·ŠÀ±áCø¸1òûˆ½È£0s8^ÁßEìC>ÿîaœBãÔËMøe*Æ…Ñ¾ŠXË>*"Ç#øÓˆ}ÈëËã`å>÷ÃU/^>(Yûˆ·{òßî=²m¡<åhdV¸í/Ú%{
+±–D{Õ¼M!·½jÈn¡Ë.WÑÙópËÏš·%Ä“wƒ!Ã†‹ÎQÑğA¤"GLxˆjƒÅ=Ï‘eâÊ<´A·"Õòdiğ.Ú˜‹[‘ñz"Çb:°\>al×"¹bÂuäXN9D¶‰ó#[3X¾‡œÅĞy!RÈ.1´ÌX;™?µ–Øö€åÌpØ¡´V‚Ÿ 9£O9…¡…“ æÂÉæ-ĞÃÑÈş…ØÊÀn`ŞˆıwlÅ´w™¿dhFìYæTD6ƒ 1o24'öšìÉÜöÂp÷àÍÀİÀÜ;p4C1€	à”¾fÄ¤)IS`£“ú'}“‰f=½`îˆ^´X+0,zØÄl"Œ6@L…æBJäĞh@ŒPî„ÑbYÇ°Ñh&MêÃĞhÀ¶­m››‰Ú4ØÙZåNX›ĞÜ´ÀÕnj"-sG,ZÔ‚‰ÀüV\‹†©¼‰õùòfÉ—­Dî°v¡§&†çæoÑf¹Fƒ˜¾@ög•&4wÿ–7Ã'îh®”>_OÏ™sÓÇÉÕ®Õ_ ós)¡¹\é_¹û¸W3Èã?’)_²ô—äB+1~>
+9ÃÜÿÆ²%$–@Öÿ±ÍZ•bù»†)W²ò·e”ZiÆGÈ¦ÿ?Õ…–&÷İ~š[¨İÑCŒÑz‹ŸA¦ÅC—‹SÑßÿônÉrDŸ¼{½&…Ö[;ü.äÉYbìVëï{¼'1?ô°óÚ Ö_;æ
+X†lßuB;j½}÷‰¹¡ÛÔUæàØÀĞW;øRXnÌö\C[ÉZÏÍ“óÂT«­-Ô°èÛ_ŠÜ`§iN´ËŠşÚÅ{¸åÄ|×­CÁÛZµËà9q\<Í“ÚÇ¢¯vĞI°|>BAí­è«Ùï–ó¾³k!	ãÀP0œåB81°Æ•¡×C6ÜÉú\+z‹Ãvs@ìzTÑ[ãK†¢G˜X}”BÆ Ø¾pVû‚±¬ wFw¬™ã†š…¨Ú„ÂŠ@t @³Àş©¨øÉıfDg’fì+ª­èc0JD	VQ‚"‰ÎI4¶ª"_ÖA€$‡6ÁT=2l"ItAòu ªFÄº$DçË¥Å	•›–¸\èJy2ÍXzu8±rÌG¨ãI	š9æUá†¹ÓQˆÎ' ‘[?üÁ«À¾üh“F¢K%ÉS¤şñ	(ï6ñÙßÅ2¹u )ëÁ–ÚAædIË¿ÀÕHIºÙÍBX¾ãş½–À.ñ°åÏpÄİÑå"ÍØƒrÅöûæ`¸
+ÔÿúÓÍ®á˜’Ôu ÍÌjÚ¼jê5ƒ“%GÀ¶?ıpab#ÆäŞ} AĞ`…Ö-À4	ì	,ûÅ·§9õ²Œ.T&AµéÓ/û·¯‘r€ã$‰l›öƒ¯ÏOŞª7brU1’² 8kÎæÚ`A£Û"A4 Ã³ÿı—Y[Ê¡F£Œ.T¬ 	¾îã9kÊŞÉ ‘r€-	 aäê9Ÿşwzthxh¸ŞˆÉU9áîfÒšÿ7cé–Tô‚hçæ5KæL›¹ÖåˆÃÛ†ê2º„*–Ëå)¡m‹?üó??ü|ŞN;Lªõƒ§Fchóúµ+–-YU—ÅzY–õz#¹„ª–äÉ=Fò¸iÉ4ĞŠ¾ŞQêÃÉ’xÙˆ±,S,“K¨pIîR*ËÒPI ÂHº§SL1¦èî.¡ê%¹§”ÊX–†‘fBpwÉİSJ’»» !‹’{J)–ei€Fuw¹»$AÈ¨ ¹§IÄHA#!A2,A€   t5 VP8 È  °? *  >1‰B¢!!ê…¤ ³ füè¿fü€ìLæş#òGò+æÔşû7è¯Ç.}CÙïéşé>qÿ¤õKæúyşk©ï˜?èâÿd=ŞÔúİô ı“ÿÿíOê¥ı¿ıç°òïîÿ¿şØøÑ|%şÓşÊü
+ş¼ÿéë áuşÁô«å¿ø«¾ãßKŸ7û/^Ğwã¶&õ·<şÕß¡«|¿Ìú©ş¹ş“‘>fÜÑıÉ|™ÿÁ÷cîKéÿı~áÍ©ÿ®üãîÕûwìOú¸Ú²ÏÔô°YÚñÂl8óìÖğm¤ñ0¼ËÈ Åù£s‚f]¼ÖIĞ°>¶1Ê©pO»Qq¨şvŠTRşŞÇ÷6AÚ¹í”r'ë~ +l!y„lM8»m÷4;&Oùìd³Ë¡°3Syª§G*ò±Qa‘BŠ…:’¿E YœtŠ½¸XJ˜Ÿ)šéMö£'pæ9@Âˆ{ïÈÊÖ‡È7•œ[ƒNû6yàu€|H;šò…³Ir¢'IÕŠcCinV›9£ªdáRkŠ¿”v6«œ-Y	2`&ÅÃÚßÈ!mê4tùéÜõ…;”‘7U€:T·¦Õ¼ıeìÌşüN××Ú¬^Ío‡¢>~Êf	‹´îl†öB³Zú¡doö•Dşú› şÿ¼_èNä1™ÕªiQuF´¾ú?XÁïq X†vÄüŞPõía ”+xíx¢ãúËÎÚWÕê¦ˆÒ=óIüPCdÎxFeíÈf¦J§vQJ4c]‹®7¿
+ïàJKÓ¹6sé¡u°Ãºø˜ñ¼:xßeWfÿˆ·YåP0±Ø£Mg!µæWú<£øí~ûÿÜ‰7~Y ˆ ¦.¹o	¾'§Àn¢ğ›‹Éïçèâ~5lú÷<v[İël¾5m7>S>ve4İ)•q5pZıõ[
+W÷ó>V-ö}òÿè3ÿ×¥W4ş{İãyÏü™=&şx¤3ªWÇoşoË%D‚¾·p1Âô'5Öy£´¦¶Ğ'rºSvB¹uÂa¼Yl’"İWò.UÙy†ãÿU!Å1T¾ß‚Vûx›¼Kı³*Ğ™Ï—ùb|‚m( )? 	³µ¿İ¼¢zPÅæ§qò?òT‚cÛ,¸%O‡_rw]×yú’˜˜ãİv@&Ynka„*éû_ÂwMf7ÀI
+^érä÷ş^ñÇÆ³ìû¢Ùó²×µßÏú\	P=n¸–²´¬àæùĞMhuÿpZÂ†ÿ¥PµP]§?¯„ áÇı
+¦–>ï£áµÌ’
+=êO/Ÿ¬^}º4ê­”»¤+APa‡½Xñ”ò’•Ğ«ğ44ø¹PU?Òø Œee1Z±b »ª4ıCR¬%Itc9GáˆZíIÙuÄ¶èo[1&ò¼¨éçëìz%ÜßÒŞş¬<Œ•an2l•Ï¸Xaz’
+î‘
+p”ddõ—à;*KZú2÷Ñ7ıw˜'?Ñíÿh†>0«ÖN|\KÑjù)Ã–…qÁæâ:`é[èDCüñ8õ+£›Í:eÌÅûÄãtü<0¿pïñäÎ-§sÄÄ
+ÖÜ™ğ—ùĞÕòÍaù¾aö¤}ˆ"KƒT;J{SÇ;8°cEWª’-Ï
+6S\\İ	TæÊ¶hVÄJ‚e?¨”×ôtwGbWæ´ƒTÙK~´ó¼U5—TˆBÓ\ek³ÑK”	©"%€®˜‚İølkM
+Ù99{	“løó´OˆÎF¥P|ïXI`ÃÕ8~¬Ã1ë5ÇğÌ‚åæÀùÉD_‚v}RÕ®W“¢]üÿ>]æ3„lW¶2ÜÍ‚·óM²ÉAw6¹ë0(5:Š!’xi-^ÄàÂ)<}‰<r©nw¼³n÷pğöºs§ººÁq-ÀÛüOkNŒN8ñ¬Şò,¹şä&r
+QãC±¤ÃyN1¨Fe¸CFVeHxiÊ‡#„Q'Ş^Š,*<í§)ô¦e¦ 
+<büİŸ³æŞ/ÿZMü;2t¬ÄøçŸí4\®;¿îQ|9¶İ«t7ÿC–=Ùò%ş~Q—C
+yä–v¹c°dGm“öüë©åy½Å|ù²Æö*ÅŒ+ë·íz1¥àÊ–ÚD§ÒJÛCtÀüĞÍ›53+EzqÖíeÒşµê)EEÛŞ«éYù«Wc,~
+ß§wiÆæÜ¸·ê5I¤”{˜%ºOÈú·“f7Y‡‡Ş»Zf¯P¾im…«[?ò8ÈŠ/Ä”3Àm µëë0~lAéOŠôS™U)î˜"8ğKah±`?İcdOkyZ
+©ğû×ùÖÎÏæXfø‹‚s?~ıV³‘`ÍŠKp&zĞB€†.e;9ãùp‘Wñõ·rÿÓBO ~Ò8E†²·:q ¨(ÁY×&b{¥ßÄv@­9}Í¨ßºåU*&½Ó™:.t|ß4^öÄ€ö˜j7Ù)Û1má^“&6(…ŒƒÚÊ‚‡qeÄ¨"7*O„¤±7,
+©5,ƒÀî—ÈYÿ:V(î%‰…ø+ò«­í=¬Dó¦ßƒôîo,¾İq¬L»÷KióøßÇ›¬#7ø3<}l;çY%·™-ÅÒ•Î‰A@½›=è‡ŸûN5ÍbcpE¾:§Û²{æáÁ]¹Qÿ·Eì¹àÎ5;9.˜ŞÜx¢3‹Ï%;'TÿnW¬ÅğÔ‰G‹†Â…—»š Ç¥ŠÊKÍÌgñ˜“#î]*`¯ˆ_­7+ĞĞ›úˆs
+ÛvH•Ú·Pih¼rwYp ÖPxÅ›»^*/vç£O1§¶Èæ€Pg”ƒáØo^óœÁmçœ/5”Mİ¡¢œ>±Ç÷ô;1ú´3¼àg;IXR‡à
+Ú9Áç˜±ä–WÛÊ²I‡¦?:qª|>ÄzJ‰´ñí™0zâõş&\6·¯ïrd@| {İH´Â–[ØÎí4rù…‡_öâ½y®¥À³‹˜oı“º<ÁĞdj•ì#¨/­¶×Xpm«K¾‹tú×eú7Ê.1.dgG$#
+NêC¹´#œ
+y9@ÈQ'[šíŸÃ‡€¬(®|®à|h
+/bÁ3-³î¯DÜbÒ€í#Ûa_ú4ŒxCÓG´t±-ò¦Œ³¶„a‘½_A(‚`«xÓQ¿µ4àMQşİ¼¥üú^Ÿ²™\É+Õª½ì¾J­ötXûÔä5'Ï—ò¨¿÷ê-ê^ 1$.ˆÔèE‘àÌšş`ºæ’¦V¤?¾Ps®t[rÚG§PP`zİõàë/3Ã‰!şA‹X	qcw9ÊÁ#»î‡+À¼"(TAÄ¡2-À„ÍTÇbØœÓ„Ÿpÿ¿^ÓÉ‡J°à†’ZÆûá$¨3<ŞèMe~øeJÒåïöæ ŠY6>:óç£u#}°¿¯Ïd-÷ÏN´øİ×Œ6ŸA$”.0Ÿ>»ÀTğĞÿó™»,lèpéNîÈŒ)Ù÷h&^ŠíÚN±ÁÒkãªË»ôlÅWÎŞÓ'9Ò]dú!$çÌËñ¥‚¶‘_{œ1_¥vÀÍtÊyç§–Xr§;i"4ª¢¡Ú§¡PÄŞĞ¥„9‡öãÿ¹šë¦£1MÀŞì›˜*©=wµ`@ÈhĞDá¬¥ëÄ(4U9fDJØ¢ÊÀÔ1b8´~6ëìz³Ö”'­ü0ìš	ôŸì¹‹üaš ¸o
+ ëE…Í}Ùü‰=ZÔˆ¹ÀY€‰´4ŠĞpÊyYôó™‰<åÚ_éÙ$û¦DH’Üúã|)gÖ Ô›m`>sˆÃÌÑñU'TWpÑ+æu&5é¬-¡u¬q'+ƒß'PÁƒk*’Ùr[ƒäd½YY-§8ÊüÆ×ä£–`”¸‘O­#êš?[ÆõŠ[[ĞHíÑ,}à¢!51p\Zw1•pŠfn·Ñ¾Ë‹Ş0„ş6Ş¾é‚Ì4QZàBfDéØ§H§’îıéÆyåéè¥/k7aÏÙºÊˆA‚<c|–é˜‹ \[vúwÔ]J«P2@.ƒxIõñÌW;Ù\#p˜ÅŠ_Efçâ	®nÀúc—TˆN¢ËlºnÅs,×·56º¿&LíJb9
+â‹JÏ»Â}ª€ŞM¿»0Q¡s"8Ü é°kÅâª.±K½$.­Ç«![™y‹©Á´„°wŞf]SšI$CLqaåÆTôƒùm„7[òİ?cŞ÷2CÇ;°´=Ö¾Ë¥ïxÛwÈ?‘m6§nu…Új
+0‘1ì²R·:`m&Êt\Uk©dÆVSÕXè*SP~¥Iñ—†Ó7ÿaàoPxàV ÎööF`ÁœÒÏ¥VÈÆû{\º¡QôC€„mäZq¯}ÛqKx{F]4şÕ.ÛšÌ€5MNû™®~ë;3FÜó)9ÁïL$Æá
+Cİïš{¯†Üˆ˜õQÙä$2ÅÇŸN÷ÉÅ¥ Îã~RõH–mÈ®IQE,vøU¸Ğ¬Vc½»p«ÛdÂÅeCE	zï†`ÉÌ8hÁö3Cİ‹˜êwûÙÀ_·=j…'í)\d-~˜ø;$…¯Gbßôc.yºAsÔÙ&»Æ{DV)\YY!Âˆù	TIfÂÁ›¨»ùç‰J_N‹!üÏxHpºó{ßè¿^C@p’õ9@ÖdeGß’ÌVúÖÑ«–	 ºš‚Õíİøƒ$â<gw3¸°,¾ÉJVÃ¡å 
+'‘š¬±În%ÅÉõ;‹ıõÏ{È„tşÉFkİuı×“‹™Rşª]z &ø™x1'EÕ®Ù@Âîàü`/÷tµÛkmÇ›õYúíöQ ]3g¯ÏÓ¬Ô?ä›ô}T\ªÌNÎÎØ¸Ÿ]!U«¤49µÑ'WXpÃ -ú8     
+RIFFü  WEBPVP8X
+      ¿  ¿  ALPH‡  
+ ³m›"Yyß¯ª»»»+9„¹Ëp‡È!r
+İİ=‚Èİİî®ïÅ¡k¯®ÁDÄ`°MÙ{’k¨0¨u©÷ &
+†&3&[ïù'!&åfj°ë¾›¢™zJís·<Ü=¯Ğ`ÇÓñ§ì9„is6ík§>Šr
+5NÛHè}
+;Ÿşè©)¤|¬Á%@]Å" 5ÃN™~\kÅS!‰rd•ìØÙ'‰Ê$´;ï¯P”!ÙñÏßSlìTÔ#Q˜¡vÊ9¿PYß¨Pœv˜rgl³€íËƒ)ìwkBLq
+uí«?™g|&KeÚ¨w,e`˜ŒRT}Ï€ˆ	,"X¨3‚JÕ !CÒËEB†T,ÔÅ¢ÕÙ6 U0ÕªX@e Pøàÿÿşøÿÿ¡²ìD÷X(‰&æ€¯5©P¾iÇäÀdŸhF¡|ñãh™:ƒWé…Õ…òúÔ‘µ!Cê=L,<0Õİ‹mxrÔæ6G_|{JŠêRl.?ªr+Kç¬@mõØ;Ğ­(<à†1sëŠè^€óWîÉ&²ÔÇÏ,¢HvÈÓ°æ´µûWğb7=»¼ú%•$oF¦s¿8t…^¹jÌªøSe$r€KÍ<tıœ]NÔsôo¿zûÑw×¯ÅÏiÈRrW‡×?úáÈö<ı4sãúá¿´‘fÌEî’øù£¯z^qÂÌl1ÒŒÈÕİål˜‘ì;¹êDÒräI˜ ¨çSH#²äî’PŠ$ÍŒÈX‚ËÒØcú	3™.9ê1Ba$‘½ A„~'@‚’‚°
+¨âûl VP8 N  : *À À >1ŠC"!!Y,À ¦àì
+ÆPÂnøû[áŸµü—üùÌ·¿³ü1òy'hf÷Ôê¾íşuÃõ-şCÔõCüïåWkÏì¾ˆVÿn}ÜÿézÎô şyı­ïú?ı¿`ÿØ_Zû_¸_
+ÙØØõcÿÁ{û-°Æ$óçÚìÎEÆß…Á›4võ©Wöø†ıL»d§%9%#Qô JmıÛ¶^~êgï.eQİø†×0I	!áÛïè'¥Ô°v‘òûÜ†[ÿøoè„b^¨™á÷W¹ÊåNËÿ÷AÂh ÈÌóİˆ¶ÏäVû,|Òw>-93°If##èA¸Ì7i’Te÷Ûã~1W‡Uìµ…©Âí]%¯sÄó°™3¬$„HèìëÃ5x_!çF4Kô&AD5ú,z“Ø¨…åv3ó6ü§¹Ye'Õ PÑ]¿7ˆ3Pú–ÆôJcJÉ5É²•”Àà*
+şºó0úEıüzn)La÷9ÿô½ŸıqÊx]ÿ×xêv%©ğ
+ÎßÿÿòLâ²\F‰ÉSs¥”~ÑO²–š¿š—IE!£útÛo!	~!7-­·ˆ¼ä•2m€ şğé   ßÿÔ_.*[QßòÔ.RÄçõÃ`!²˜ö§û¯4ûÂ¼ç8Ï}şu…ü,uL•ÿÇl‡`II¿æqw#ÿÚ=Ïjİ©§Oÿ
+–kÄ¹™¸œ@¡¹%†ÿæºóØÈêİ¿ğ$kÀV(Ğ©Ÿƒà0#UºQ_,¢^ı¥è÷£²$[ãöò#IÄEˆ» 5~¾ŞMŒRˆz÷†¼-Š¯pJ¹¹;­ÖcÈc&eN’Gİ} iXñCÃ1\×xüÖì/•ˆñpôc?;/§Z€‹Ÿ?Ù¯u=apºqœ'È6üê>‚¥Møè¨TQ}Ö6ÄZPQ="Ì¤Vt?¶¸ûŠÙGßDx%…ûÍıÆö~	Y`Óè±XŒû 'µ\ğ8n¼ƒôuÍ~”5˜.lV†äø¦¾
+ëtV•i¾l±õ¥(lÊ6é,²<µUÂS¸ş^>İÕCÿ#ºèïZ®îf'Yw_ø¤Õ×€²^5;Âğ5ï‹ï'ùğŞ–Ãí˜»ŸºC¢ÊÒákÀ}ı9
+±±0÷H#%Ğ|F\à×zÒğşN®İ¯˜˜?ÃØ©“I¯‰‘‡ó.où¶JÏñÓ]ä.½B9Ò$Eİ!†­O*}™ÖyZ$?”7¦®íæ™?Ø\Œå+½›=H—<ØZCş}$v¼jÍÄWÔ,–f0àãÙq®HpúÀÅK;Æäy§ë8 8ğd(s½‡$‹¢ÆµË$î¥/Î9E’+>ØÇY!”¨ĞC4?ÆsA” –r-ç­–[”¯…AÃnŞ%ş×ÿßñäÿÿ¤0qŞñ_âeºşnÑ¥7³8O¢)›3}Š*`1ÒL$‰Çz§"<â»C‚ÆùÅfi´c
+|Ö©iâç
+Vø¸­ÀScĞ®†}4­eq®Éo‡‰Qhnma²â}ºŸ¼à~CÙ&cH¶ 	2Ôß3…º×NÉ‹|7¦_Øœ\<¡#hß’B»ğxP°^deoß ~*¼7Ó¶åB{æ	 ©?p›4scÜ~½á)"ùCpFíG¤É‘MãW
+>•ÎP»bË†?¯ä9(&Ú'UŞãÑÿ•ŠYİ±–x€INÔÁâjõ	ŞÈÚ%seà4§˜º§(œhi«ùó»sÌø&;İT]ÍìXªW£-#c |KL›³!5àşX%ı
+UĞ6hVæíá¯Äègòâ:2ñ3öòê´—áT=“/xË&•5ƒò89Û”Š¯wOH"ïvÊ>}J3×ÇNç8˜‚©£Í[+![Ú O^ÓKÍáÔW’ˆŸæ
+ığ/rSÙßŸdUaÔÚÚó1ªÉ	ä;9÷ûÔˆZ4'­–KĞkô;½h:”ßªv%>Ùà`!ä9¸í¹ 6w;qœ¤`asFBì*ÍÆ¨¯èNH¬]KÇŸ}Qş¤—r Œ`x 8V~šTò—lÒşÅÿÍËsÇ §¦Å	ˆ¤êÉ[ŞF_:Ä¿-I›Ç´“	ËÁ©:DĞÁåƒGÊU‡M&Ïi|4—]ü´KØ³vŸ™š5hı@zê-6€tÆÅû*[ÚN^¼¸Åò"'aŸe¬èÀ7´@/hKŒ}Œ2OjBR{­n˜`Ÿå·4$ıER!'#°Õ¦]:Ùÿ)a;øg°›næ´C L·½ŒR8& £(¸w	ÿ¦?”±<ä)ä=’¹8­2ósÅ×‚mo¯NÌØÆQ#.€AÔ`ÃZV!G­²N«£M{
+jm—øÀIzÛÙúp]S÷˜zaàûo™êß-Æ¡`=RñE:¥òlNÿ¦Xø±‰g‡Îg§¤×²Nªs™”rEÂç„}5Œjr£G]J^0÷Ë~P·œ‚j°ÿDóãŞ›ègõºuê‡å?bÊñ:·ãn ®V5{ıˆêÆ=QZZ1ŠyØ'Ú—[şâØîCáˆàÎçâ…HÆÉÍÌ}â, Ñ&jïV$ ;Š¡ÎóåÒ+pûVOda¸,—\İÓ·Ò&@×0ôpË›/~y!òp¨ïB½èí›’Üÿ6î˜:OvÙ¦ Ë¥ö‘¸ÆÛëÒ¼'˜õ†3Ü<şƒ~ÎzJÑîsô”@•†½y(bBÌ<ıh¨»º²D„4ôX‡òñcÁzò™!7£ÁtáâIV;üs´¯jVÎ(ªvHöì_!9*)ÄyY)¬œ,±,¦>aÓ¿½?Mº]Y:9üM„¢^O­r¿ö=ÁVq€
+ğ:·j7W~Æ¼™àï^ûÉ„WÓ—a…,Mş2
+j½mÛş 2 Zªš½x‡qÒEõ
+kN	eŸ¥¦ô¦^mùç¦Ä „#>Ğk©“&³*ü„zlŠş/÷ç¥/"‹cÌEŞåšÎ  ÿze(‘9Ãß’~Û““ñ'X­À=1œt{68Á†) üï¼Øh®=_‰şÊbÁ*rìEVõL¹*ˆîxlÄMHïÖé¿4¼†mğ
+±yNñŞ& b/\PĞ,¾ê lL§»û’ñ.ã¿Û¾eYG w!Ç•“ÎÒ«'İ¸œN	.GtX·Y£ô L¬©ÆÍ··ÅöìÜmLë}ùÁ¡ø&İ÷JWæTÖ+©¶DcUºP/JS§<ÄyÂ;KèOpQş<ÇS™i]Ë‰„3ş+rÀŸİÅÜ¡&!ù›¹=ä¾Ì^=â¢=~wH3Yçw}×ËÇZLÔ†oİV˜LãƒœÊSWî¡/óÌÕi Á‡K6qÿÅÏ¼’˜7;Á`G¹Ç®9‚ı® {¢vO^¬¿Äâ¿øíı÷=.;¨•¤ø§Ø2ÃÖº£÷O™˜ÑÎHİi‡æ5)øœ^¬ÿAï÷ó¾¶tD$©”šv¯|ª©^ Ã‡~·“&¶)£ü$@ÂY%pâÚv·v¾Ü4cÕB%¹ !]Ég¶cˆ†ªÿ³ÿKsjI¦äsÈ)Ïåé²1ĞÖ’ş¯ô&"´[@G
+]VO«W[8ˆïœ§“‚Î–ªÔ¿=°³í—Øÿ®õF¥×å›øv¸Â ‚ÔèI¯ê¹3è ¶ò5´0²Õâif,¥»Ç‹±|ãp—æü®p€CŒ®OæÒÌ_Û!Çuy¤öxgıâsVrR"­Ã`’ïáÏï2É=]éXßíÛ8¼üÏÿyç‰uÛÓ™×&ÃÅ†X8|A„Y
+ã›	ş”¼£º‹wUF:»Shóg¿ÏfË8Ú,(¶7?ıè”¶tG›'€¨],81•Í„™~ÀiÊ3^øW».o Ä6ûğûëg„Hhş7AÕ7­¥ÄãV$O¬­ÅƒaÜk1e'ZÚfçbV®ªâ[è®ikÙ7ŒÿMg
+°Ã¸ízWò/å—ÊïsY¡';9ß¥ÂÒş™:õV£ûìtM4CDv›		 €8æŠw$PD¼ÓSãòÃcÃ;aFˆší%÷38èéŒ¸»ƒ³6’ã¦™i‘€           
+RIFFZ  WEBPVP8X
+      ¿  ¿  ALPHf  …mÛ6í¤óÿ‡Û#"ú×€¤7^£Áæ’ö_!"R«I’$ENFõ®˜™™™o,ıÿ/R×IÕm6W"&`<aÛ¶¼m¶mÛ~œ—7I™™{333Œæáó™†ü<£gyfÌÌÌO™™¹uÒ†Ñ!GºÎcØulY:Ç1*ÿJBK2¶ÛHÓÉr†ÂÛENlÜ°nıúueÀ¨ÎŸ93êäˆÅCØnzn¸àêK®¸âÂm[7oXWŠ„]ëü©¹cG÷ÍÎ¾ıúşS,ììl‰W`İU7İ~ãÍì–?íşÅ§^xs(Êlƒâú÷}øİ7nc¡íE´/"‰…G_|âG_N9§^¡ÂÌ»?ûÉÛw TKB,·±­pèé»ş÷‰ÓPÊTS—•Áû¾ò…;ÖÕ!1vª gŸú¯{tT³Ó´ŠèÍÕßøö×BZãl[gúû«q1Š*úÌ/üÌùPÁjÌTŸù…Ïˆª2mB•™ïùù<×Vofáüüùï™¡*¦I¨góüø§¡fˆÕí¬ğéÿÁ-ôŠi¡¨lø»÷QÄªW‰ŞÜñ£ß½š
+QÑ7äf\‹˜*ÕÜü#ß5&Ÿd>şïÅYÄUIóŞü8–&\é¹ø;>µˆ	«RáSßq1}™d>û•5ô…‰\zÖ|å³€&Vô\ñµ+©!&´¢rå×® 	%øğÇÁÁÃÇ?šD2[>y}aÂ—‹>µkâDåæ bâøĞ-Ô˜0‚Û®¦/LÅè¹æ6Ğd!nØbJl¼¡0Y·^bŠ
+®Ù6QÎ»”*¦ª*—nŸ‚-ça1eeÎÛšfëF,¦®Ì†mx˜
+3Lí™
+xÕI¥ i%J'­.‹)_‘Wœœ~'YİÇO1õO_M;‰§9uÌ«Å>J;ŒW…9¶µ€Ø}¯Ãk„[ÀÁ›‰ÇÎ/¦	¼DçqƒgcÑÌ=Í¸Û/½†iFóæóx¬R'¦1?J‘;şŸ.[";î¢óø$÷ï&iÊdÏİŒOzÏİ4èı³®câÎÿLçÖpÇ¿eç1áÎ—©4gåµÿa<küWDƒŠÿy;úqÿòTÉÉrú/cPyäIš4¹÷úsğGtnwüY†WÌÿö •F­<öw^©ìÎş[Å|j+SıWO4kòÜ¹®Hv§‹âvqáwwu%ªÿìA*
+[yâw+eøtnwüæ©R—¯úÿ•JÓVşïÏ¼|îò—‡]¶Mv£_ë^®‘ümLãš?ÿ
+—KşÕ]¥¶N-{~Ñ±\èK­cdÆ7¸JÑwß¤´~È›™©äÛ64¯‘3Ôq|ì(ëóY•¨k>ƒÕ>âäYgªø–5ˆ†ì:ƒ¤†ø&r}@*Æhğ	²4Q&·Ú~™
+¾dÍ¼m
+’2ñnPA¦]Š”å=d×F&“S&CIÔò¬6'‡:¸¤D\2CC/Y”]D+™´­HÖ­di%df
+²Ü€ÕJâdƒ)ÁU4õ²RŞ²¥­fŒC—Dí°)òRÚª×$ˆ€.ÂÑPNfAâK°ÚIœÌ@ËîÂÖšbb‘ÚhhÈ°DLDÄF{@„ĞŒZ«Û HPÊ
+4W1ø´¶¹:u$(ÍÕÖ	ïÔ\-Ak› äÒ\I"n-z',×Öª–Y¢¨ÙZîÑR`4l­aÏ’Íèlk†x)0?ßZgÏ°d3ºµÎœÆKINŸl®9r)Øs­ubh/Á´Ö‡ıN ïm­ƒKµ¼µ”ØëğRHïEn'Ë{,Ù~k–âän{INï;LSÏÍ:½“›Åídöqâw+_£©gÏ*Y²ñK„[ÉÁ«ÆK²3_ª4z!m/œo¾ECï%ÍÒ]óğ+¸•Ì®·³ú2òIÂmäà¹aœƒ±óé^­¤úTb¼pÍçwÑÌ{ŸÌj–n÷yø©vzé­ÙKÃ©ú árğè(ÒœSŸ¤8zöçdÜ×7Ÿl¥Ÿ«#ã¥aWê„ÛÇÁıCªÍ¹:k½ÿ€ZHGî¬™æ\m÷ıìC4ñÓ/ô½ísÁÙ«ş7‘­“Áÿb”æœ%‡®Æj™«8$ˆ®ß²£}¶^x¶C,¯
+GnÛÆºjN,«šÛ¾®ªeT×^x–PÑÉë‚¦+GêÄrK°oG¤ÚE©v#i™t:ueĞ°qIÏÀ å„wo'Õ*Jv¾‘Ë.Á@'.v‰F@Z®…Îİ3Jµ‰R›^K³ÒE/	5Î?FÇŠ›½*V‹Èeİ.h%á×wÈ-bmÛåb%d™;³&.	h%À6~v­ªZCUëŸIÙfedÉ];‚æŒ­{û’€V0é='ŠÕ.óo’˜q´åÇÊ¦µæ1ËfL²Ô×6GSgG%ÇÄà=û:·„»Ã»è
+a›|ò¬¬VÕ?š²Æ°3òÑ·‚C§Òflí¬:ùÜšh…¼z\uÌœ=»_È-`u¯½NŸ'p:ó™YqÏãi§g;³âûÊÓÏ:r©™ö8	;{åİGeM7Ysw§ú´Ñ8íìŞ}’©êîyõi›qwfö:u×z<ÍÌº»æè3ÓŒŸ³Ö‘
+S=ÖQ­iÆ_dÖ:‚4­„†YsU€]kAVğ42ÔÄ£¾V›Õi€n­6z;ÒôgÎ*  ÍµÍ`°–Á'.Âš2'O"I¤Iº®ˆ^¥Œ©b1wƒ 
+wéº2À·ß†cšÀş3¶AÃˆÒ•ntÅ{–¦„a~wbi¼¢”®t›ß½EÖTpphrb (])†w\®”&-v¿ì’^8	¢DWJÇ™Ko€&œÅég÷9«m˜H%ºÒ)|ÓùªÒs³Û‰™˜’"J)]áğ¥×ÂšXî˜â+3 HRD)àÑUak"%ğÒ=g­Ñ3Q%Q¢”àÀ¶+7*ÑÄIûï{ÜôY3=i I%ÔÁáí—¯	[%)œzè¿GfTÁ8(¤ˆˆÎ'Nì¸¤(ÑÄH£Çşu—£¯µÖ´Í–Byÿüö#M„t¡âMê¨Ö>3ÍÄÖ¢¡"vŸØtA˜Xe™*Ì?ø—wÙÕ¾¯5m{RI,P1»vÌˆDZ56!üÏİ™£Qß÷53™äĞBT¬}oŒ6^P%­ÛêË÷{95õ}_kM{¢ âøóıô	ÒÙÀŞ§îüƒYÃhØF}_Ó0é
+@€#RºøC¾é"€´¤1°­ ØûÂC¾åT‡£ÑhÔ×´m¦ XÔ`2Š%.}Ïû¯¿x -–É+ Nïyù±ÇŞ²­~~4
+G}_3Í´ÔÀ†®„%6ßxëW\°‰Eíe‘XôÄşÙ—}ñ8¶²†Ãá¨ïk¦™ w0]×•®+¶¤MW^}í%nŸYÏrŸ9}xßÛ¯¾ñÆÉ´¥:ªµï‡Ãá¨¯™ÆLW-À”®ëJWbP”BÄúm—]¸ıü­›6¬]Sº"\û:œ?=wìà‘½o=‡ë(k_û¾ú>Ó˜é+À.¥”®”®Dé" @Šµ3kÖD9>›6` gö5k_k_kíûLc¦¶Ceñ(±°ĞQeÎU.ôÔ\X³.é´m¦º$ED‰%"’
+ €ÒiÛéÌ¬²f¦eê-ŒPÑb¡ÅA€Á‹çb®ÎôBL#
+¡…¡PH±a0‹¤N§bLS
+„Ğ¢HBB,46¶ñ¢ƒiR@XcÓ¶b¡XT€YÔ,4VP8 Î  S *À À >1ˆB¢!!:]œ ²7{H€…æ†ÿMø“ÜÖüŸ÷OÚÉks÷OÁ¿ÿŒØãù&^}~{íÃè—¡0Ô¿ö_ÕÃş½w6ıõûÿşO»ÇûÚ?zâ~À>@?”Yÿÿíoÿ/Úû¨?óÏñû}s?nş?jÿj~ÿœjÿ·ùÿÜÓßÖ_ì?‹?®ş\¡égöW·ÙË¾ç~‹ú·¶ÎÍxz÷z´~]ıÓ¿£Tßù¤¶õã¿¶gÔ?ÑıÃ|®ıCècéßü>á?Ì¿­ÿ¹ÿûÑşGæÏØ/¢êªK"¶fÙˆx ¤.‡½–[]
+òR:U ˆÙÖh¦CÂvØ‘ñhÌ¶2 îkOàƒş=1 iXGÔÊ©ÕúÏ9ú ä<ÊÊ;x¤LòßıÆù(ù›–,‘	·]%ÜÄHŒ èã1
+ H˜˜c†›S+ b1=•ñÙÖzEsŠÈ.ºñ¶š?8Soe¨Um*/Ã³s?ÿÓ¯İ@ğ×©ö×¶’;abHó¾£	ñ«p–Él—\.íÄzß\õ,q'œ¢ëÕı|åõ4³‡,šî0é™[@UyUØØÊ^LáD£÷y@Ùz÷1ÈJÉ••şv™.gÁå5â>™eÃ9üŞV…p7@ë£”.PapJ9GaÚf€Şu-;ìª~ÂonıLİ,¿ª]ù‰TÓçÅg7Àq¦‘ŞÎ1­²~RÌF”{æó¾Ó1«™«KhÁÍâyØœ·ÿqºÉ{oqS&›áz> :Óë¬b‡Ç&±ü{Z#’,ù’i¤•öÎ÷
+±~İWh~çÉÍä¢ò'H¯ÛÍ°np?³Dç¨˜‘  şÿ
+d?”›%sİu!cägHà‹\(˜Şs0ÕóÔµÖ¸ç€teMĞÓ{à5hø¶ä%ô!Ì	ZtáB
+>ÁMß„ÖÎÁ¯Á4Í¿qf¿¿X'L,0[ÀKjTf &Âæñèíß…{‰2~)Ò `¥çue^u¥ŠÌ±~Ú0zv¿,Ë·ºê¨hIc*¾(a^bvøb¯îÉ4º†´æÕ|ØVÒis¾+Û>!h—Øò¡À‘œáiâï„İuœmôCİ2IğÛ
+($Åª3a¸&ºîZÕÁ9§sÄ¬ó«GÇ%’+›ù*ë’œcÎ®3FWbèUŠÚ¸ZŠKì2ˆky"ã™ `ÿæµñ-rî£FD¸´äºj+_é¾ß˜\6ğñ 1ğq2ã
+Úx}_ï§LF”•±y<tù‚t¯à5hø+äÕ<a”Áéÿš±" IşJOÃwËƒXØ`g÷ü´ïÊY÷à°¼ÅHYîéƒ¦šX’Vnf%¥ğ­,—B—ãÙ¨÷ó¶ƒ/Ï[g©>I‹Ê‡qN½Ü­³™_¶ûOıƒN¹€¡hr5‚k™PáoNÈRÒë¸È …¼¥İÂ€_p`‘Cãæ ×œ”ñ/vü ¬ZšéG
+¿àfê
+‰~7§/¶Ÿ¹×"ılÿˆ™·×ËÃQ*ş:§¢ï…ÅiÄ:Âº—}¾Wvİ‘¢`ÎÿõêjĞ#ƒ£u³wÎ"å;r<(’ı¡tÑÿûWl_´Â!\R5#:¥‘ Ÿ“X"4ø~ßR$º
+ò¦‡K¦ÌÔ4q)ZÇ2•QœíÚùÉ
+O@ÆÛıM±eÚp˜M¢½Êñ®.vÙî¨²~UÑ¥ïXâcdiˆå¨¹öh ÅUz¨Gi'êdòÁ“`ûJÍ²ëø<åÓ¿ë"“7?‘Cøå0C{¸ñ§ĞóÂÿk™‰;4Ÿ¯sşŞôqĞBªïÉQ[ÅÅ
+g)rÆ&<7tV™W{ŸZ†!å³ï2*t»2pò€7·a¢æqMî´‡¢IËË+PœJÄ
+zŞOFR½âĞãlL…ƒ°*ßĞ–Ò®*bøfÔ“ñW÷®XQ¾lâŸ9cÀ¢¨/{Û 
+B\A|çŒşL¡ÃÉóÜt59FŒ<gÁ–C2Ü¨váu#Ç˜Â$Ñ¬$±ë<à<ğÕıRoËÂ£|›ÜrUÍ¦vw
+£åv^5ª’½úÊ t­ùÎ:ÒF±'R7^ø6~
+¿àŸİGd¥ü±íX	w¾•e>†÷>…ó‚A»i¼Š“LDóìbFGxÔÑ–åK‚¿}ÿ2œÛ)B–¿œ›èQªL"§ÃU0_æº²şG_¨‰£²ÃJjqH+ìäóÅÛºÊ¸0§Ü\}­%¥÷;:¶,¥…€Y-y!8ñè[ÅwóKæ›7ÕCş%HCš¯ÿ®ã;#ÓüÅ2ˆİáÙLië@ípú	yMŸ„cû§Ç¸Ñ|4”g.’19ÕbâÈ/m[¿ˆh;Ëÿ*o2€ÂÄº7oÛ)õ ¢B{bW‹È|wM«¹ TÉ{R”œwŞµ$´àpõ»¯şÿ¦ÛcMY;³™³5µã½fŒ+ıúõÕ…Û åüj4ŸÓ¢Ró¤vS×ñ¢–'ş‡„yàö "Ğ'`É ?"$:wr)^­ç«|WPÎ8R276£i†ß£¶eÌwñ°…(æV‹ª_ q‚?ÅÊñà|dKäª~$´|v}’ÄPø¸8ˆîèÀ.PËÖrÏe¶³7Ïëºm%:ÌÈK‡š¨Ïcéš_–yÓÙ“4Å°äVmëLcM?5±¶ÿÿJÙìë#ã"½#€»„õŸéÏeï˜ıI´Gö·ÌúK7k›ÉuRòêæ¬æó!(xBjF¦dHÀR3|ş‚G¸³HY*›î`å–U'§êB¶pãiHW¬·?3¿kN@eÿÄ_0º0ÕÏ›Ë«6’o$yAÙ$
+ ¿šŒ ½ÃÇ‹õ´³¿eWšõTzéíF€_0	n'	<{¶·kîLc'Éf§úˆÒ½.ŠŞ³a«Jâ/+
+´á* {Óì·ï­üı&²Pbÿí•ùşŞx¹‚é·ì©NÊØ°¡ˆìg˜'àD£´€x Ç?Â_œ³ø´Ô°xt
+óEÅ4‡™Cz·gª•`!v1ôšK0¶I%ğË&ØŞ&‘2¢œIÜX=(`†¼ªå{aµ¯¯òîUxÿ ?jPøÔ(O÷YÀàİ„JTåù 3ÕÎûsÀËJLmŒ¦OPõÇ¼äçÜÇëTûÏ8}cÈCÀôÓÒ
+ƒ%NfË	6+K’³¶L“£Ù;¬q˜Sû½õêrl«n8áL¤©ÿ14òÅÿ,e1yQd¼?ÿÿæ)\
+2è¹¸FÓxõ°ùvJ%¸Z©sº+°mV ©^‹·X}§ìppÔ§¿¿ñ’åT»ĞÁ‘ğ¥E«-Ã³é¹]Ë¤­ñŸµåËA­¬–óŸ0ZkvØ±î¥
+É´»<D™{òŞ™:‘€õHì™œÇ½³ÆoOØ+HÛq¶f"WãRÂß“qì×Ûª‰~T,Ò!C„V6§Ó	b q~i`M™d½U¸’E!³Q/àPs§ÀŒ5ª_ş°õİ>uÜ27P
+u§Èöã AïÇ’*ë¤Ûu2â^PÃ¹k9)‰=ñ)v<A 4ë;p´ïìÈà~¬Ãj0——BæÍ¹6&,ñÜ&X¿	ÄIÑ!y º¹’~n´{K]¹VÜ^TD¬lu®åÆuÃéÍZû>7îÈD¸¯x´ªÀ<§…KU’  £P¦ÿQö“Oò>€¨-÷®×´å©l”j©Ú€şJWa‰ÖÃiÛ‹OJå7œ>ı×šıÀ·Ñ%ÿÚ¬ÁùzªnIÕ_ÇSHßI¢¾äh‚s-!Ñ½aGºã¼÷7bMÑL@#zÁYpŒÔUŸ‘¹õ`î‚ZR§ŒKé·Ùù7êG!?Šy[QGå~ûxo7Sö×rOJå'²,ëFhåQPn]Hìy~—õG†ü7 h-°Ÿ|£×ğ—$Õ‘¬_Ğ@ËààkzBqveô¾ÁšéÁ*€‘=7ÆîúÿkŸğ:;é`ÎÄ¯LÇ?Aş‰T»­æ„·µV=ª AÁåÄ ½
+7$aìRS_}cª}í¸l
+xÛ‹]uÜ–“û‰6qz9Ô÷ùŒ$º/}Ëö:øAB"dğE&¶îÎÿ¤­ÒÔ|¿tÀ{œõ¯æ^úŞO¶­¬¤v°Œ27Ø³½MiW+²}¯%õ%»q¿
+ĞÕOåŒ'”$é5Æo’@£´€íŞ|²ó[Í‚¬‹WfÒ[â°}ıéÂÉ¿÷xWÆİîuâß,ŠVÍ+ùC¶F¾õkĞ†D³š±‡J§R¤îÏß£ã4ŒùëæüUÈô=rÇDL.·ÍI‚?|{ŞGIAíşäC1¶»96²oTl#¦¸‘Ò»Ö²yIµV½:dJñà£ß×©"¶üÔ,¦İ*‘F.TüB’À=±{|Êˆšé{Ÿ´,>GùAÉåcÙ±’é%
+_yB`óÏ|ñ¯í:_+c|”"ÀãÏµğã
+ôíË.7ó‚ü'sÈm¼å%Ò¤® æĞPñ</¸Ğ}BÇòêİÁcj‰„\íƒµ2äv¢İ”dFv½/  Ûx‡”õûtö9êäìŠ\º]ˆ"'ˆFF¢sL#F=‡F&*¡h·ÌŸ!Ë…³²•¹"‹ê=×WÕì\_{ÂÛ^Ğµoñ¬ùÂù‘N¥0«¿¼µC´Jœ»R6“SVa»EÎ©˜®ëüPò.7Ïa(ÌÈ)-0Bù’¢:Òá‚SuN‡ÓFÖÍ#\/	xÎ×’W=]‰~QÎĞ*ÿ¼4M&WäìPõ8šm¢sÆâóüqä
+MNtæÇ/±cƒY2ÌMŸˆ >ƒUÂçãL…gš¬³
+ºâÚ`ÇÃí•w°¤zDs‡Ãsiª…Å½ÅºŸ_P¼ªüZ%¡ö5ÉEÇò7,h\8aWhÂ}V˜¥Q®UªŠ£šfcÁÂÊ ˜"„€N©âŠÓğÍ’êøCWC4Õ½œÔ?”½±Õ”Új{Şä¶OÈ«ªKöÎ
+$)¢­B"$òâƒü”>¾·Ü¬iÙˆdğÉÑäÍGÊT-«æÉ˜Æ’M^Ğõr`,×74\ğª€–HÇÖmÁÀŸ~±=ù=(á4ŒQ9SİZP¿ÄÅÔ,­%fç+ìn~[nS,˜u	ÿ¿¹ğE9½”şúço¿.}‚®B_zxÄ¤tGLó&àı‰«Em_m&ÈåµT!½ü0şÍ“eÄ Ülë±©WÿÏŞ3yœÓW—Ó®÷rÛ¸4qˆğ›:ÍÒ óÙØè êï›s®}÷XÒx×;ØWaPŞHH=ô ¾ÓS~Îe3vhß™ÀìqµvöÃa(–¢y{Ô|Ä´Ö¤_£#ôÕ‡ØùiÄÔO–°øfÎ•d “3GB}Í3iü¬üûŞ#§Ó˜
+¦Ğä­5’/JÕ÷³«
+,¤ =©Á9Î'Õìİx=¿®Ù?3ÎzoÍ€ŒEãáÊ
+6¯zIÑ¯¼&1$Ûkà*NNˆ°èè  Ğ•8-…†zæ¯^T·²¿‰³Ÿ†ĞaÍzé>¹)·¸—@¾:¡ÂÌgoÌ¿£sdÖÄ8+Óµ÷İ]wÓ9J9Fç`ó‡¹ÌX,Ÿ5e• Î‚ëÕüoZ¨
+ŒDMÑ×I™šìI— Õ\:Œ‚Ï|}Y™L$.Ã¬j¨bn¹—V0†µ1¾é4ï İ´µ1ªåM]¸¨ôg±I¸y6X°c¿ĞxàšvnFÅàûµmæ²LIFØ‰ñ!‹r[%'Íö°AÖYÕÍ[ïÿbq!÷QZ?ğ±U….+aj€Æ©^'7®’³¨*=^î˜˜Úú¿ÙøEƒ
+ÿ!@&±ìjv¤–¥Q—¡UòvÓC¯WCÕ×R±ZÖ   Š°XÁ=qgÌ”<ºJÍîí"i'fµşÁ~‚ºŞÉ»Ãu¸Ú
+”]Ú¨÷:…2‰Ãë¥yø¯ÓV›ËZ0«R…€»Oãô®,®n….´ñ³µÿzC¤ıt™BÊ§°L	÷Ôš?[LgBVİöÎ$X~OÏƒ¸n‰ï³¹¾Õ°tÂ³… #Öí&ä¨Øõ!Ê!Ç©‡–c€íi„á~ú©Pl!%ÿRßÁ²¶ùµd;½òòË?%7Ñ\úiÑà}×ØK@D9syCCç¿ì0ö´<£›TP}Ã($»/æĞ      
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="highlight_green">#00FF00</color>
+    <color name="dark_gray">#222222</color>
+</resources>
+<resources>
+    <string name="app_name">Sonim Reader</string>
+</resources>
+<resources>
+    <!-- Base application theme. -->
+    <style name="Theme.SonimReader" parent="Theme.AppCompat.NoActionBar">
+        <!-- Primary brand colors. -->
+        <item name="colorPrimary">#000000</item>
+        <item name="colorPrimaryDark">#000000</item>
+        <item name="colorAccent">#00FF00</item>
+    </style>
+</resources>
+<resources>
+    <style name="Theme.SonimReader" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#000000</item>
+        <item name="colorPrimaryDark">#000000</item>
+        <item name="colorAccent">#00FF00</item>
+    </style>
+</resources>
+<?xml version="1.0" encoding="utf-8"?><!--
+   Sample backup rules file; uncomment and customize as necessary.
+   See https://developer.android.com/guide/topics/data/autobackup
+   for details.
+   Note: This file is ignored for devices older than API 31
+   See https://developer.android.com/about/versions/12/backup-restore
+-->
+<full-backup-content>
+    <!--
+   <include domain="sharedpref" path="."/>
+   <exclude domain="sharedpref" path="device.xml"/>
+-->
+</full-backup-content>
+<?xml version="1.0" encoding="utf-8"?><!--
+   Sample data extraction rules file; uncomment and customize as necessary.
+   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
+   for details.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- TODO: Use <include> and <exclude> to control what is backed up.
+        <include .../>
+        <exclude .../>
+        -->
+    </cloud-backup>
+    <!--
+    <device-transfer>
+        <include .../>
+        <exclude .../>
+    </device-transfer>
+    -->
+</data-extraction-rules>

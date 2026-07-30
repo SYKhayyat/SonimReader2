@@ -1,0 +1,33 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# The Studio template only ignores /build at the root; module output needs this.
+build/
+.kotlin/
+.idea/
+
+# Packaged output
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Signing keys — never commit
+*.jks
+*.keystore
+keystore.properties
+
+Thumbs.db
