@@ -2,9 +2,10 @@
 
 Getting a build onto a Sonim handset and finding your way around the code.
 
-Read [Known broken](TROUBLESHOOTING.md#known-broken) before you spend any time
-wondering why the OK key does nothing — two documented features are unreachable
-and both have a written diagnosis.
+Two features this README used to list were unreachable on the device, and both
+are fixed; if you are looking at an older build, or wondering why night mode
+moved off `5`,
+[TROUBLESHOOTING has the diagnosis](TROUBLESHOOTING.md#fixed-and-what-to-expect-on-an-old-build).
 
 ---
 
@@ -38,7 +39,8 @@ commented as such in `app/build.gradle.kts`.
 
 **Everything is a key.** There is no touch fallback, so a key that does not
 arrive is a feature that does not exist. That makes key dispatch the highest-risk
-part of this codebase, and it is where both live bugs are.
+part of this codebase, and it is where both of the bugs that reached a user
+came from.
 
 **The whole file is held in memory.** On a device of this class that is what
 makes the index map, folding and search straightforward. It is a documented
@@ -100,10 +102,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 On first launch it requests storage permission, then opens the file picker.
 
-**Grant the permission.** Denying it calls `showStatus(...)` and then
-`finish()`, so the message is posted and the Activity ends before anyone can
-read it — from the user's side, the app exits silently. That is a real defect
-and it is one of the good first fixes in §8.
+**Grant the permission.** Denying it now gives you a dialog with **Grant** and
+**Exit**, or **Settings** and **Exit** once "don't ask again" has been ticked.
+On an older build it called `showStatus(...)` and then `finish()` on the next
+line, so the message went into a view that vanished in the same frame and the
+app simply closed with no reason given.
 
 Browse to a `.txt` or `.org` file and press OK to start reading.
 
@@ -122,7 +125,10 @@ adb push notes.org /sdcard/notes.org
 | Volume + / − | Font size (10–40 pt) |
 | D-pad up / down | Scroll line by line |
 | D-pad left / right | Page up / down (in search: previous / next match) |
-| `#` | Cycle encoding: UTF-8 → Windows-1255 → ISO-8859-1 |
+| `#` tap | Cycle encoding: UTF-8 → Windows-1255 → ISO-8859-1 |
+| `#` hold | Toggle night mode |
+| OK tap | Toggle the search box |
+| OK hold | Enter the editor (after a confirm prompt) |
 | `*` | Toggle the HUD (clock, battery, progress) |
 | Menu | Toggle auto-scroll |
 | 1–9 tap | Jump to the next bookmark in that slot |
@@ -130,8 +136,6 @@ adb push notes.org /sdcard/notes.org
 | `0` tap | Jump to a percentage |
 | `0` hold | Toggle reading direction (RTL / LTR) |
 | Back | Close search, or prompt to exit |
-| OK tap / hold | **Search / editor — currently unreachable.** See [Known broken](TROUBLESHOOTING.md#search-and-the-editor-cannot-be-reached). |
-| `5` | **Night mode — currently unreachable.** See [Known broken](TROUBLESHOOTING.md#night-mode-cannot-be-turned-off). |
 
 ### Org files
 
@@ -145,7 +149,7 @@ Chosen by file extension. Five keys are remapped:
 | Menu tap | Open the Contents list |
 | Menu hold | Toggle the HUD |
 
-### Editor (unreachable today, but this is the contract)
+### Editor
 
 | Key | Action |
 | --- | --- |
@@ -203,7 +207,8 @@ app/src/main/java/com/sonim/reader/
 
 ### The key-dispatch path, in detail
 
-This is the part to understand, because it is where both live bugs are.
+This is the part to understand, because it is where the OK-key bug came from
+and it is not obvious from reading `KeyCommandRouter` alone.
 
 ```
 hardware key
@@ -240,19 +245,30 @@ Seven test classes, all against `core/`: `BookmarksTest`,
 `EncodingDetectorTest`, `FoldingModelTest`, `OrgOutlineTest`,
 `ReaderModelTest`, `SearchServiceTest`, `TextWriterTest`.
 
-**`ui/` has no tests at all**, and that is the gap that matters.
-`KeyCommandRouter` is a pure function of a key code and some controller state —
-it is the most testable class in the project and the least tested. Both live
-bugs are in the key path:
+Plus `KeyCommandRouterTest`, which is the only test in `ui/` and was added with
+the two key-path fixes. It asserts that each documented key **reaches an
+action** — the failure both bugs were instances of, and not the failure a test
+of the action itself would catch.
 
-- The night-mode `case` is dead because a guard clause above it returns first.
+`ui/` had no tests at all before that, and the cost is measurable:
+
+- The night-mode `case` was dead because a guard clause above it returns first.
   The compiler does not warn about an unreachable `case` reached through a
-  guard, and no test asked what `5` does.
-- Search and the editor are unreachable because of view focus, which a router
-  test would *not* have caught — that one needs the device.
+  guard, and no test asked what `5` does. **A router test would have caught it
+  the first time it ran.**
+- Search and the editor were unreachable because of view focus, which a router
+  test would *not* have caught — that one needed the device, and a
+  screenshot-byte-size comparison found it.
 
-So: a router test would have caught one of the two, and it costs almost
-nothing.
+So one of the two was cheap to catch and nothing was looking. The rest of `ui/`
+is still untested.
+
+`KeyCommandRouter` carries a primitive-only overload of each entry point
+(`onKeyUp(int, boolean)`, `onImmediateKeyDown(int)`, `onKeyLongPress(int)`,
+`onEditKey(int, boolean, int)`) precisely so this is possible: `KeyEvent` cannot
+be constructed in a JVM unit test without a mocking framework, which is the
+practical reason the class went untested for its whole life. Keep new routing
+decisions on that side of the split.
 
 **There is no CI.** `./gradlew test` before you push is the whole safety net.
 
@@ -271,7 +287,7 @@ ls -l before.png after.png
 ```
 
 **A byte-identical screenshot means the screen did not change.** That is how
-both known bugs were confirmed, and it is far more reliable than looking at a
+both bugs were confirmed, and it is far more reliable than looking at a
 small dark screen and deciding whether something moved.
 
 Always take a control measurement with a key you know works — `0` opens the
@@ -297,26 +313,29 @@ adb logcat -s AndroidRuntime:E
 
 Roughly in order of value against effort.
 
-1. **Fix OK / Center dispatch.** Either extend `MainActivity.dispatchKeyEvent`
-   to intercept the centre key while a document is shown, or
-   `listView.setFocusable(false)` and drive scrolling from the router, which it
-   already does for paging. A handful of lines, and it restores **two**
-   documented features.
-2. **Fix night mode.** The `case KEYCODE_5` is dead behind the `isNumberKey`
-   guard. The mechanical fix is easy; the product question is whether `5` should
-   stop being bookmark slot 5, or whether night mode moves to another key.
-   Decide that first.
-3. **Test `KeyCommandRouter`.** Pure logic, no emulator needed, and it is where
-   the bugs are.
-4. **Do not exit on permission denial.** Show the message and offer a retry
-   rather than `finish()` immediately after `showStatus`.
+1. **Drive it on a handset.** Nothing here has been verified on an XP5s since
+   the key-dispatch and night-mode fixes landed; they are covered by unit tests
+   and by reading the framework, which is not the same as pressing the key. §7
+   is how to check, and it is the single most useful thing anyone can do to this
+   repository right now.
+2. **Extend `KeyCommandRouterTest` to the rest of the key map.** It currently
+   covers the two paths that broke. Every documented binding deserves the same
+   assertion, and the primitive overloads make it cheap.
+3. **Test the rest of `ui/`.** `ReaderController` is the large untested piece,
+   and its four collaborators are all interfaces, so it takes fakes rather than
+   an emulator — `KeyCommandRouterTest` has a working set of them to copy.
+4. **Add CI.** There is none, so `./gradlew test` before pushing is the entire
+   safety net. The `core` and `ui` tests need no SDK beyond a compile.
 5. **Delete `app/src/main/output.txt`.** A 140 KB dump of the project's own
    source tree, committed by accident. Not referenced, not packaged.
 
 ### Conventions
 
 - Keep `core/` free of Android imports.
-- Add a key binding in `KeyCommandRouter` and nowhere else.
+- Add a key binding in `KeyCommandRouter` and nowhere else — and put the
+  decision in the primitive overload, with a test, not in the `KeyEvent` one.
+- A key that needs tap-versus-hold goes in `isDeferred`, which is the single
+  definition both key-down and key-up ask. It used to be written out twice.
 - Two dependencies. Adding a third needs a reason that survives the target
   device.
 - Anything that writes a user's file goes through `AtomicFileSaver`. There is

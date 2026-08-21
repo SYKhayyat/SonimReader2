@@ -4,25 +4,30 @@ A keypad-driven plain-text and Org-mode file reader for Sonim rugged phones (bui
 
 ## Status
 
-Working and in use, with **two documented features that are currently
-unreachable on the device**, both confirmed on a real XP5s:
+Working and in use. Two features that this README used to list were unreachable
+on the device, and both are fixed:
 
-- **OK / Center does nothing**, so in-file search and the editor cannot be
-  opened. The focused `ListView` consumes the key before it reaches the router.
-- **`5` does not toggle night mode.** The `case` is dead behind a guard clause,
-  and `5` jumps to bookmark slot 5 instead. Night mode defaults to on, so it
-  cannot currently be turned off.
+- **OK / Center now reaches the reader**, so in-file search and the editor open.
+  The focused `ListView` is an `AbsListView`, which claims
+  `KEYCODE_DPAD_CENTER` and `KEYCODE_ENTER` for an item click and consumed them
+  before the key ever reached `KeyCommandRouter`. `MainActivity` now hands that
+  key to its own callbacks first, keeping the tracking that makes tap-versus-hold
+  work.
+- **Night mode has moved from `5` to a long press of `#`.** It was written as a
+  `case` below a guard clause that returns for every number key, so it was
+  unreachable from the day it was written — and `5` was never free anyway,
+  because `1`–`9` are the nine bookmark slots. Night mode defaults to *on*, so
+  the practical effect was that it could not be turned off.
 
-Both have a full diagnosis and a written fix in
-[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#known-broken). They are marked
-in the tables below rather than quietly listed as working.
+`KeyCommandRouterTest` now covers the key map. It is the first test the `ui`
+package has had, and the second bug is exactly the kind it catches.
 
 ## Documentation
 
 | | |
 | --- | --- |
 | [docs/ONBOARDING.md](docs/ONBOARDING.md) | Build, install, drive it, the architecture, the key-dispatch path, and the first contributions worth making. |
-| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | The two known-broken features, plus storage, encoding, Org, bookmarks, building and on-device debugging. |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom-first: keys, storage, encoding, Org, bookmarks, building and on-device debugging. |
 
 ## Features
 
@@ -31,14 +36,14 @@ Verified from the source:
 - **Reads `.txt` and `.org` files** picked from internal storage or SD card via a focus/D-pad file browser.
 - **Automatic encoding detection** (BOM, strict UTF-8 validation, Windows-1255 for Hebrew, ISO-8859-1 fallback) with manual cycling between **UTF-8 → Windows-1255 → ISO-8859-1**.
 - **RTL/LTR support** — auto-detected per file (so Hebrew and other right-to-left text renders correctly) and manually toggleable.
-- **Adjustable font size** (10–40 pt) and **night mode** (dark background, on by default — the `5` binding that would turn it off is currently dead; see [Status](#status)).
+- **Adjustable font size** (10–40 pt) and **night mode** (dark background, on by default; toggle with a long press of `#`).
 - **Line-by-line scrolling and paging**, plus **auto-scroll** at a fixed interval.
-- **In-file search** with next/previous match navigation and a match count — *currently unreachable, see [Status](#status)*.
+- **In-file search** with next/previous match navigation and a match count.
 - **Nine bookmark slots** (keys 1–9), each holding multiple positions per file; tapping jumps to the next bookmark in a slot.
 - **Jump to percentage** of the document.
 - **Heads-up display (HUD)** overlay showing clock, battery percentage, and reading progress.
 - **Org-mode outline support** for `.org` files: fold/unfold sections, jump between headings, and open a Contents list to navigate by heading.
-- **In-place editing** *(currently unreachable, see [Status](#status))* — a full-screen editor lets you modify the file with the T9 keypad and D-pad caret movement, then overwrite the original file (with confirmation and unsaved-changes prompts). Edits are saved atomically.
+- **In-place editing** — a full-screen editor lets you modify the file with the T9 keypad and D-pad caret movement, then overwrite the original file (with confirmation and unsaved-changes prompts). Edits are saved atomically.
 - **Remembers per-file state** across sessions: last reading position, chosen encoding, RTL setting, and a list of up to 15 recent files (stored in `SharedPreferences`). The screen is kept on while reading.
 
 ## Target device
@@ -54,12 +59,12 @@ All navigation is by physical key. Behaviour differs slightly between plain-text
 | Key | Action |
 | --- | --- |
 | Volume + / − | Increase / decrease font size |
-| OK / Center (tap) | Toggle the search box — **broken, see [Status](#status)** |
-| OK / Center (hold) | Enter the editor (after a confirm prompt) — **broken, see [Status](#status)** |
+| OK / Center (tap) | Toggle the search box |
+| OK / Center (hold) | Enter the editor (after a confirm prompt) |
 | D-pad up / down | Scroll line by line |
 | D-pad left / right | Page up / down (in search: previous / next match) |
-| 5 | Toggle night mode — **broken; jumps to bookmark slot 5 instead** |
-| # | Cycle text encoding |
+| # (tap) | Cycle text encoding |
+| # (hold) | Toggle night mode |
 | * | Toggle time / battery / progress HUD |
 | Menu | Toggle auto-scroll |
 | 1–9 (tap) | Jump to next bookmark in that slot |
@@ -100,7 +105,7 @@ All navigation is by physical key. Behaviour differs slightly between plain-text
 - **Build system:** Gradle (Kotlin DSL), wrapper pinned to Gradle 9.4.1 (which needs JDK 17 or newer to run)
 - **Permissions:** `READ_EXTERNAL_STORAGE`, `WRITE_EXTERNAL_STORAGE`
 
-The `core` package is framework-free (no Android imports) so the reader logic — encoding detection, folding, search, bookmarks, index mapping — is covered by pure-JVM unit tests. `ui/` has no tests, including `KeyCommandRouter`, which is where both known bugs live.
+The `core` package is framework-free (no Android imports) so the reader logic — encoding detection, folding, search, bookmarks, index mapping — is covered by pure-JVM unit tests. `ui/` is covered only by `KeyCommandRouterTest`, which asserts that each documented key reaches an action — the failure the two fixed bugs were both instances of.
 
 ## Project structure
 

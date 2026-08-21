@@ -3,6 +3,7 @@ package com.sonim.reader;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
@@ -13,6 +14,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.KeyEvent;
 import android.view.View;
@@ -142,10 +144,60 @@ public class MainActivity extends Activity implements ReaderView {
             if (readGranted) {
                 openFilePicker();
             } else {
-                showStatus("Storage permission required");
-                finish();
+                showStoragePermissionRequired();
             }
         }
+    }
+
+    /**
+     * Denying storage used to call {@link #showStatus} and then {@link #finish}
+     * on the next line, so the message was written into a view that went away in
+     * the same frame. From outside, the app simply closed with no reason given.
+     *
+     * <p>It now says what it needs and offers a way forward &mdash; and which
+     * way forward depends on whether Android will still show the prompt. Once
+     * "don't ask again" has been ticked, requesting again returns denied
+     * immediately, so offering to ask again would be a dialog that reappears
+     * for ever; that case is sent to Settings instead.
+     */
+    private void showStoragePermissionRequired() {
+        boolean canAskAgain = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && shouldShowRequestPermissionRationale(Manifest.permission.READ_EXTERNAL_STORAGE);
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle("Storage permission required")
+                .setMessage(canAskAgain
+                        ? "Sonim Reader opens files from storage, so it cannot open anything "
+                          + "without this permission."
+                        : "Sonim Reader opens files from storage. This permission has been "
+                          + "permanently denied, so it has to be granted from Settings.")
+                // Not cancellable: dismissing it would leave a reader with no
+                // document and no way to pick one, which is the silent exit
+                // wearing different clothes.
+                .setCancelable(false)
+                .setNegativeButton("Exit", (d, w) -> finish());
+        if (canAskAgain) {
+            builder.setPositiveButton("Grant", (d, w) -> ensureStoragePermissionThenPick());
+        } else {
+            builder.setPositiveButton("Settings", (d, w) -> openAppSettings());
+        }
+        builder.show();
+    }
+
+    private void openAppSettings() {
+        Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", getPackageName(), null));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException e) {
+            // A stripped AOSP build need not carry this screen. Saying so beats
+            // closing on an exception nobody sees.
+            showStatus("Grant storage permission in Settings");
+            return;
+        }
+        // The permission is granted outside this process, so there is nothing
+        // useful to come back to; relaunching is the next step either way.
+        finish();
     }
 
     private void openFilePicker() {
@@ -175,7 +227,51 @@ public class MainActivity extends Activity implements ReaderView {
         if (controller.isEditing() && router.onEditKey(event)) {
             return true;
         }
+        if (shouldRouteConfirmKey(event)) {
+            return dispatchToRouter(event);
+        }
         return super.dispatchKeyEvent(event);
+    }
+
+    /**
+     * Whether this key has to be taken off the view hierarchy and given to the
+     * router directly.
+     *
+     * <p>Android offers a key to the focused view <em>before</em> the Activity.
+     * The focused view while reading is the {@link ListView}, an
+     * {@code AbsListView} claims {@code KEYCODE_DPAD_CENTER} and
+     * {@code KEYCODE_ENTER} for an item click, and this list has no
+     * {@code OnItemClickListener} &mdash; so the centre key produced no click
+     * <em>and</em> never reached {@link KeyCommandRouter}. Search and the editor
+     * were both unreachable on the device, with nothing logged. Every other key
+     * worked because {@code AbsListView} does not claim it.
+     *
+     * <p>Only while a document is on screen, and only while the search box is
+     * closed: with the search box open the key belongs to its {@code EditText},
+     * whose editor-action listener is how a query is submitted.
+     */
+    private boolean shouldRouteConfirmKey(KeyEvent event) {
+        return !controller.isEditing()
+                && KeyCommandRouter.isConfirmKey(event.getKeyCode())
+                && controller.hasDocument()
+                && !isSearchVisible();
+    }
+
+    /**
+     * Hand {@code event} straight to this Activity's own key callbacks, skipping
+     * the view hierarchy.
+     *
+     * <p>This is the same call {@code Activity.dispatchKeyEvent} makes as its
+     * last step, and passing the decor view's {@code KeyDispatcherState} is what
+     * keeps {@code startTracking()}, {@code onKeyLongPress} and
+     * {@code isCanceled()} working &mdash; so tap-versus-hold on the centre key
+     * behaves exactly like tap-versus-hold on every other key here. Calling
+     * {@code onKeyDown} directly instead would have delivered the tap and
+     * silently lost the hold, which is half the bug fixed and half of it moved.
+     */
+    private boolean dispatchToRouter(KeyEvent event) {
+        View decor = getWindow().getDecorView();
+        return event.dispatch(this, decor.getKeyDispatcherState(), this);
     }
 
     @Override

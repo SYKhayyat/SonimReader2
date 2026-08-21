@@ -1,14 +1,12 @@
 # Troubleshooting
 
-Start with [Known broken](#known-broken). Two documented features do not work,
-and the symptom in both cases is "the key does nothing" — which is
-indistinguishable from a device problem until you know.
-
----
+Two features documented in the README were unreachable on the device until they
+were fixed. If you are running an older build, see
+[Fixed, and what to expect on an old build](#fixed-and-what-to-expect-on-an-old-build).
 
 ## Contents
 
-- [Known broken](#known-broken)
+- [Fixed, and what to expect on an old build](#fixed-and-what-to-expect-on-an-old-build)
 - [Keys do nothing](#keys-do-nothing)
 - [Files and storage](#files-and-storage)
 - [Text and encoding](#text-and-encoding)
@@ -20,19 +18,20 @@ indistinguishable from a device problem until you know.
 
 ---
 
-## Known broken
+## Fixed, and what to expect on an old build
 
-Both were confirmed on a real XP5s and both are still present. Each is
-documented here with its mechanism and its fix, so nobody spends an evening
-re-deriving them.
+Both were confirmed on a real XP5s, both are fixed, and both are covered by
+`KeyCommandRouterTest`. They are recorded here because the symptom on an
+unpatched build is "the key does nothing", which is indistinguishable from a
+hardware fault until you know.
 
-### Search and the editor cannot be reached
+### Search and the editor could not be opened
 
-**Symptom.** Pressing OK / Center does nothing at all. No search box, no
-editor, no prompt. Tap and long-press behave identically — that is, not at all.
+**Symptom on an old build.** Pressing OK / Center did nothing at all. No search
+box, no editor, no prompt; tap and long-press behaved identically, which is to
+say not at all.
 
-**Confirmed by** screenshot byte-size, which changes whenever the screen
-changes:
+**Confirmed by** screenshot byte-size, which changes whenever the screen does:
 
 ```
 baseline                              33,074 bytes
@@ -41,115 +40,102 @@ OK long-press  (KEYCODE_DPAD_CENTER)  33,074 bytes   <- no change
 control: 0 tap (percentage dialog)    30,774 bytes   <- changed
 ```
 
-The control matters. `0` and OK travel the **same deferred path** —
-`onKeyDown` calls `event.startTracking()` and the action fires on key-up or
-long-press. `0` works. OK does not. So the deferred mechanism is fine and the
-key itself never arrives.
+The control matters. `0` and OK travel the **same deferred path** - key-down
+calls `startTracking()` and the action fires on key-up or long-press. `0`
+worked. OK did not. So the deferred mechanism was fine and the key itself never
+arrived.
 
-Independently: with a document open, `uiautomator dump` reports the whole
+Independently: with a document open, `uiautomator dump` reported the whole
 hierarchy as `LinearLayout` + `ListView` and **no `EditText` at any point**,
 before or after pressing OK.
 
-**Mechanism.** `MainActivity` gives the list focus deliberately:
+**Cause.** Android offers a key to the focused view hierarchy **before** the
+Activity. The focused view while reading is the `ListView`; `AbsListView` claims
+`KEYCODE_DPAD_CENTER` and `KEYCODE_ENTER` for an item click and consumes them.
+This list has no `OnItemClickListener`, so the key produced no click *and* never
+reached `KeyCommandRouter`. It vanished. Every other key worked because
+`AbsListView` does not claim it.
+
+**Not the obvious suspect.** `KeyCommandRouter` handled *both*
+`KEYCODE_DPAD_CENTER` and `KEYCODE_ENTER` everywhere it handled either, which is
+correct and non-obvious: this handset's `soc_matrix_keypad_0.kl` maps the centre
+key to `key 352 ENTER`, not `DPAD_CENTER`. The router had that right. The defect
+was one layer up, in who saw the event first.
+
+**Fix.** `MainActivity.dispatchKeyEvent` now hands the centre key to its own key
+callbacks before the view hierarchy sees it, via
+`event.dispatch(this, decor.getKeyDispatcherState(), this)` - the same call
+`Activity` makes as its last step. Passing the dispatcher state is the part that
+matters: it is what keeps `startTracking()`, `onKeyLongPress` and `isCanceled()`
+working, so tap-versus-hold on this key behaves like tap-versus-hold everywhere
+else. Calling `onKeyDown` directly would have delivered the tap and silently
+lost the hold, which is half the bug fixed and half of it moved.
+
+It applies only while a document is on screen and the search box is closed -
+with the search box open the key belongs to its `EditText`, whose editor-action
+listener is how a query is submitted.
+
+### Night mode could not be turned off
+
+**Symptom on an old build.** Pressing `5` did nothing visible; the background
+stayed dark. Because night mode defaults to **on**, the practical effect was
+that it could never be turned off - the worse direction for a reader used in
+daylight.
+
+**Cause.** In `KeyCommandRouter.onKeyDown`:
 
 ```java
-public void setSearchVisible(boolean visible) {
-    ...
-    } else { listView.requestFocus(); }     // MainActivity.java:285
+if (isNumberKey(keyCode)) {          // KEYCODE_0..KEYCODE_9
+    event.startTracking();
+    return true;                     // <- returns here for '5'
 }
-public void hideEditor() { ...; listView.requestFocus(); }   // :376
-```
-
-Android dispatches a key to the **focused view hierarchy before**
-`Activity.onKeyDown` / `onKeyUp`. `AbsListView` handles `KEYCODE_DPAD_CENTER`
-and `KEYCODE_ENTER` to perform an item click, and consumes them. The reader's
-list has no `OnItemClickListener`, so the key produces no item click *and*
-never reaches `KeyCommandRouter`. It vanishes.
-
-Every other key works because volume, `*`, `#`, `Menu` and the digits are not
-keys `AbsListView` claims, so they fall through to the Activity.
-
-**Not the obvious suspect.** `KeyCommandRouter` handles **both**
-`KEYCODE_DPAD_CENTER` and `KEYCODE_ENTER` everywhere it handles either — in
-`onKeyDown`, `onKeyLongPress`, `onKeyUp` and `onEditKey`. That is correct and
-non-obvious: this handset's `soc_matrix_keypad_0.kl` maps the centre key to
-`key 352 ENTER`, not `DPAD_CENTER`. The router got that right. The defect is
-one layer up, in who sees the event first.
-
-**The fix is already half-written.** `MainActivity.dispatchKeyEvent` is
-overridden and runs *before* the view hierarchy:
-
-```java
-public boolean dispatchKeyEvent(KeyEvent event) {
-    if (controller.isEditing() && router.onEditKey(event)) return true;
-    return super.dispatchKeyEvent(event);
-}
-```
-
-Two candidate fixes, both a handful of lines:
-
-1. Extend that guard to intercept the centre key while a document is shown,
-   before `super.dispatchKeyEvent` hands it to the list.
-2. Or `listView.setFocusable(false)` and drive scrolling from the router —
-   which it already does for paging.
-
-Either closes it. Neither has been applied or tested on hardware.
-
-**Workaround until then:** none. Search and the editor are unreachable.
-
-### Night mode cannot be turned off
-
-**Symptom.** Pressing `5` does nothing visible. The background stays dark.
-
-Because night mode **defaults to on**, the practical effect is that it can
-never be turned off — the worse direction for a reader used in daylight.
-
-**Mechanism.** `KeyCommandRouter.onKeyDown`:
-
-```java
-public boolean onKeyDown(int keyCode, KeyEvent event) {
-    if (isNumberKey(keyCode)) {          // KEYCODE_0..KEYCODE_9
-        event.startTracking();
-        return true;                     // <- returns here for '5'
-    }
-    ...
-    switch (keyCode) {
-        ...
-        case KeyEvent.KEYCODE_5:
-            controller.toggleNightMode();  // never runs
-            return true;
+...
+    case KeyEvent.KEYCODE_5:
+        controller.toggleNightMode();  // never runs
 ```
 
 `isNumberKey` covers `KEYCODE_0` through `KEYCODE_9`, which includes
-`KEYCODE_5`, so the `case` below is dead. On key-up, `isSlotKey(5)` is also
-true (`KEYCODE_1..KEYCODE_9`), so `5` calls `controller.gotoBookmark(5)`
-instead.
+`KEYCODE_5`, so the `case` below was dead. On key-up, `isSlotKey(5)` was also
+true, so `5` called `gotoBookmark(5)` instead.
 
 Confirmed on the device: pressing `5` produced a byte-identical screenshot
 (33,074 to 33,074).
 
 **Why nothing caught it.** The compiler does not warn about an unreachable
-`case` reached through a guard clause, and there is no test on
-`KeyCommandRouter` — the unit tests cover the framework-free `core` package
-only.
+`case` reached through a guard clause, and there was no test on the router.
 
-**The fix** is to give night mode a key that is not also a bookmark slot, or to
-special-case `5` before the `isNumberKey` guard and accept that slot 5 loses
-its bookmark binding. That is a product decision, not a mechanical one, which
-is why it is not applied here.
+**Fix, and the decision inside it.** Moving the call above the guard would not
+have been enough, because **`5` was never free**: `1`-`9` are the nine bookmark
+slots, so `5` taken for night mode is a slot you can save to and never jump to.
+Two rows of the key map claimed one key and one of them had to give.
 
-**Workaround:** none from the keypad.
+Night mode is now a **long press of `#`** - the one binding with no other claim
+in either mode, since `*` long-press is fold-all in Org files and Menu
+long-press is the HUD there. The cost is that `#` now cycles the encoding on
+key-**up** rather than key-down, which is what every other tap/hold key here
+already does.
+
+If you would rather it were elsewhere, that is a one-line change in
+`KeyCommandRouter.onKeyLongPress` plus the `isDeferred` set.
 
 ## Keys do nothing
 
 ### OK / Center
 
-See [above](#search-and-the-editor-cannot-be-reached). Known broken.
+Fixed - see [above](#search-and-the-editor-could-not-be-opened). If it still
+does nothing, you are on an old build.
 
-### 5
+Note that while the search box is **open**, OK submits the query rather than
+closing the box; Back closes it.
 
-See [above](#night-mode-cannot-be-turned-off). Known broken; it jumps to
-bookmark slot 5 instead.
+### 5 does not toggle night mode
+
+Correct: it is bookmark slot 5. Night mode is a **long press of `#`**.
+
+### # cycles the encoding when I release it, not when I press it
+
+Deliberate, and the consequence of `#` gaining a long press. Every tap/hold key
+here acts on key-up.
 
 ### A key works in plain text and not in an Org file, or the reverse
 
@@ -168,10 +154,8 @@ plain-text bindings.
 
 ### D-pad left / right pages instead of moving between search matches
 
-That is correct when the search box is closed. While search is visible, left
-and right are previous / next match. Since search
-[cannot currently be opened](#search-and-the-editor-cannot-be-reached), the
-match bindings are unreachable in practice.
+That is correct when the search box is closed. While search is visible, left and
+right are previous / next match.
 
 ### Nothing responds at all
 
@@ -181,14 +165,18 @@ navigation.
 
 ## Files and storage
 
-### The app closed immediately after I denied storage permission
+### I denied storage permission
 
-Known and abrupt. On denial the app calls `showStatus("Storage permission
-required")` and then `finish()` — so the message is posted and the Activity
-ends before anyone can read it. From the user's side it is an app that exits
-silently.
+You now get a dialog saying what the app needs, with **Grant** and **Exit**. If
+the permission has been permanently denied - "don't ask again" - the first
+button becomes **Settings** instead, because requesting again in that state
+returns denied immediately and would loop for ever.
 
-To recover, grant the permission in Android settings and relaunch:
+On an older build this was a `showStatus(...)` followed by `finish()` on the
+next line, so the message was written into a view that went away in the same
+frame: from outside, the app simply closed with no reason given.
+
+To grant it by hand:
 
 ```
 Settings > Apps > Sonim Reader > Permissions > Storage
@@ -251,12 +239,12 @@ Volume up / down, between 10 and 40 pt. Remembered per file.
 
 ### I cannot get into the editor
 
-[Known broken.](#search-and-the-editor-cannot-be-reached)
+Hold OK / Center. If nothing happens at all, you are on a build from before
+[the dispatch fix](#search-and-the-editor-could-not-be-opened).
 
-### If the editor could be reached, what would happen to my file?
+### What happens to my file when I save?
 
-Worth knowing before the fix lands. Saving **overwrites the original file in
-place**, with a confirmation prompt and an unsaved-changes prompt on exit. The
+Saving **overwrites the original file in place**, with a confirmation prompt and an unsaved-changes prompt on exit. The
 write is atomic (`AtomicFileSaver`), so an interrupted save does not leave a
 truncated file.
 
@@ -290,7 +278,7 @@ it makes a slot a ring of related places rather than one.
 Hold the digit to save the current position into that slot.
 
 Note that slot 5 also absorbs the
-[dead night-mode binding](#night-mode-cannot-be-turned-off).
+[night-mode binding that used to be dead here](#night-mode-could-not-be-turned-off).
 
 ### My position was not remembered
 
@@ -356,14 +344,28 @@ Correct. Unit tests cover the `core` package only — `Bookmarks`,
 `TextWriter`, and the reader model. That package is framework-free (no Android
 imports) specifically so it can be tested on the JVM.
 
-**`ui/` is untested**, including `KeyCommandRouter`. Both bugs in
-[Known broken](#known-broken) live there, and the absence of a router test is
-why the second one survived.
+`ui/` has one test class, `KeyCommandRouterTest`, added with the two fixes
+above. It asserts that each documented key **reaches an action** - the failure
+both bugs were instances of, and not the failure a test of the action itself
+would catch.
+
+`KeyCommandRouter` exposes primitive-only overloads (`onKeyUp(int, boolean)` and
+friends) so it runs on the JVM with no emulator and no mocking framework:
+`KeyEvent` cannot be constructed in a unit test, which is the practical reason
+the class had no test and therefore kept an unreachable binding for its whole
+life.
+
+The rest of `ui/` is still untested.
 
 ### There is no CI
 
 Nothing runs the suite automatically. `./gradlew test` before you push is the
 whole safety net.
+
+### Why does `KeyCommandRouter` have two of every method?
+
+The public ones take a `KeyEvent`; the package-private ones take primitives and
+hold the routing. That split is what makes the key map testable at all.
 
 ### What is `app/src/main/output.txt`?
 
@@ -413,7 +415,7 @@ adb exec-out screencap -p > shot.png
 ```
 
 Byte-size comparison of two screenshots is a genuinely useful test on this
-device — it is how both known bugs were confirmed. A key that changes nothing
+device — it is how both bugs were confirmed. A key that changes nothing
 produces a byte-identical image.
 
 ```sh
