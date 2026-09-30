@@ -1,0 +1,6 @@
+number,title,url,D,R,why,risk
+1,[Low/perf] Search recounts whole file on every step,https://github.com/SYKhayyat/SonimReader2/issues/1,1,2,Cache count per query; CPU waste only,CPU waste
+2,[Low/bug] UTF-16 loads but settings records UTF-8 next cycle mojibake,https://github.com/SYKhayyat/SonimReader2/issues/2,2,4,Persist detected encoding; next open silently garbles text,Silent garble
+3,[Low/bug] Auto-detect opens stream twice,https://github.com/SYKhayyat/SonimReader2/issues/3,1,1,Single open mark/reset; double IO only,Double IO only
+4,[Low/bug] Edit mode triples memory OOM on large files,https://github.com/SYKhayyat/SonimReader2/issues/4,3,3,Cap edit size/temp file; OOM crash is loud,Loud OOM crash
+5,[Low/bug] File picker I/O on UI thread no permission guard,https://github.com/SYKhayyat/SonimReader2/issues/5,2,3,Off-thread + permission flow; jank/crash is visible,Visible jank
